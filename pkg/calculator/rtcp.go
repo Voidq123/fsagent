@@ -139,7 +139,12 @@ func (rc *rtcpCalculator) extractRecvMetrics(event *connection.FSEvent, metrics 
 	}
 
 	// Calculate incremental packet loss
+	// Handle case where cumulative counter resets or decreases
 	metrics.PacketsLost = currentPacketsLost - state.RecvPacketsLost
+	if metrics.PacketsLost < 0 {
+		// Counter reset or decreased, use current value as delta
+		metrics.PacketsLost = currentPacketsLost
+	}
 
 	// Extract fraction lost
 	if fractionStr := event.GetHeader("Source0-Fraction"); fractionStr != "" {
@@ -202,7 +207,12 @@ func (rc *rtcpCalculator) extractSendMetrics(event *connection.FSEvent, metrics 
 	}
 
 	// Calculate incremental packet loss
+	// Handle case where cumulative counter resets or decreases
 	metrics.PacketsLost = currentPacketsLost - state.SendPacketsLost
+	if metrics.PacketsLost < 0 {
+		// Counter reset or decreased, use current value as delta
+		metrics.PacketsLost = currentPacketsLost
+	}
 
 	// Extract fraction lost
 	if fractionStr := event.GetHeader("Source-Fraction"); fractionStr != "" {
@@ -253,8 +263,14 @@ func (rc *rtcpCalculator) extractSenderInfo(event *connection.FSEvent, metrics *
 	// Calculate incremental packets sent
 	if direction == "recv" {
 		metrics.PacketsSent = currentPackets - state.RecvPackets
+		if metrics.PacketsSent < 0 {
+			metrics.PacketsSent = currentPackets
+		}
 	} else {
 		metrics.PacketsSent = currentPackets - state.SendPackets
+		if metrics.PacketsSent < 0 {
+			metrics.PacketsSent = currentPackets
+		}
 	}
 
 	// Extract octet count
@@ -268,8 +284,14 @@ func (rc *rtcpCalculator) extractSenderInfo(event *connection.FSEvent, metrics *
 	// Calculate incremental octets sent
 	if direction == "recv" {
 		metrics.OctetsSent = currentOctets - state.RecvOctets
+		if metrics.OctetsSent < 0 {
+			metrics.OctetsSent = currentOctets
+		}
 	} else {
 		metrics.OctetsSent = currentOctets - state.SendOctets
+		if metrics.OctetsSent < 0 {
+			metrics.OctetsSent = currentOctets
+		}
 	}
 
 	// Extract NTP timestamps

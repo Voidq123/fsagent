@@ -8,6 +8,7 @@ import (
 
 	"github.com/luongdev/fsagent/pkg/calculator"
 	"github.com/luongdev/fsagent/pkg/connection"
+	"github.com/luongdev/fsagent/pkg/exporter"
 	"github.com/luongdev/fsagent/pkg/logger"
 	"github.com/luongdev/fsagent/pkg/store"
 )
@@ -28,26 +29,42 @@ type EventProcessor interface {
 type eventProcessor struct {
 	store          store.StateStore
 	rtcpCalculator calculator.RTCPCalculator
-	// TODO: Add QoS calculator when implemented
-	// qosCalculator  calculator.QoSCalculator
+	qosCalculator  calculator.QoSCalculator
+	exporter       exporter.MetricsExporter
 }
 
 // NewEventProcessor creates a new event processor
-func NewEventProcessor(store store.StateStore, rtcpCalculator calculator.RTCPCalculator) EventProcessor {
+func NewEventProcessor(store store.StateStore, rtcpCalculator calculator.RTCPCalculator, qosCalculator calculator.QoSCalculator, metricsExporter exporter.MetricsExporter) EventProcessor {
 	return &eventProcessor{
 		store:          store,
 		rtcpCalculator: rtcpCalculator,
+		qosCalculator:  qosCalculator,
+		exporter:       metricsExporter,
 	}
 }
 
 // Start begins event processing
 func (ep *eventProcessor) Start(ctx context.Context) error {
+	// Start metrics exporter
+	if ep.exporter != nil {
+		if err := ep.exporter.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start metrics exporter: %w", err)
+		}
+	}
 	logger.Info("Event processor started")
 	return nil
 }
 
 // Stop gracefully stops event processing
 func (ep *eventProcessor) Stop() error {
+	// Stop metrics exporter
+	if ep.exporter != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := ep.exporter.Stop(ctx); err != nil {
+			logger.Error("Failed to stop metrics exporter: %v", err)
+		}
+	}
 	logger.Info("Event processor stopped")
 	return nil
 }
@@ -255,20 +272,29 @@ func (ep *eventProcessor) handleChannelDestroy(ctx context.Context, event *conne
 		return fmt.Errorf("CHANNEL_DESTROY event missing Unique-ID")
 	}
 
-	// Get channel state to log correlation_id before deletion
-	state, err := ep.store.Get(ctx, channelID)
-	correlationID := ""
-	if err == nil && state != nil {
-		correlationID = state.CorrelationID
-	}
-
-	// TODO: Trigger QoS calculation when QoS calculator is implemented
-	// For now, just log and delete the state
-	logger.Info("🔚 Channel destroyed: channel_id=%s, correlation_id=%s, instance=%s", channelID, correlationID, instanceName)
-
-	// Delete channel state
-	if err := ep.store.Delete(ctx, channelID); err != nil {
-		logger.Warn("Failed to delete channel state: %v", err)
+	// Calculate QoS metrics if calculator is available and codec rate is present
+	if ep.qosCalculator != nil && event.GetHeader("variable_rtp_use_codec_rate") != "" {
+		metrics, err := ep.qosCalculator.CalculateMetrics(ctx, event, instanceName)
+		if err != nil {
+			logger.Error("Error calculating QoS metrics: %v", err)
+		} else {
+			// Export QoS metrics
+			if ep.exporter != nil {
+				if err := ep.exporter.ExportQoS(ctx, metrics); err != nil {
+					logger.Error("Error exporting QoS metrics: %v", err)
+				}
+			}
+			logger.Info("📊 QoS metrics: channel_id=%s, correlation_id=%s, domain=%s, mos=%.2f, avg_jitter=%.2fms, packet_loss=%d",
+				metrics.ChannelID, metrics.CorrelationID, metrics.DomainName, metrics.MOSScore, metrics.AvgJitter, metrics.PacketLoss)
+		}
+	} else {
+		// Get channel state to log correlation_id before deletion
+		state, err := ep.store.Get(ctx, channelID)
+		correlationID := ""
+		if err == nil && state != nil {
+			correlationID = state.CorrelationID
+		}
+		logger.Info("🔚 Channel destroyed: channel_id=%s, correlation_id=%s, instance=%s", channelID, correlationID, instanceName)
 	}
 
 	return nil
@@ -289,7 +315,13 @@ func (ep *eventProcessor) handleRTCPMessage(ctx context.Context, event *connecti
 			return err
 		}
 
-		// TODO: Export metrics to OTel when exporter is implemented
+		// Export metrics to OTel
+		if ep.exporter != nil {
+			if err := ep.exporter.ExportRTCP(ctx, metrics); err != nil {
+				logger.Error("Error exporting RTCP metrics: %v", err)
+			}
+		}
+
 		logger.Info("📊 RTCP metrics: channel_id=%s, correlation_id=%s, domain=%s, direction=%s, jitter=%.2fms, packets_lost=%d",
 			metrics.ChannelID, metrics.CorrelationID, metrics.DomainName, metrics.Direction, metrics.Jitter, metrics.PacketsLost)
 	} else {
