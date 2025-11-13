@@ -122,6 +122,11 @@ func loadFromEnv(cfg *Config) error {
 		cfg.OpenTelemetry.Insecure = insecure == "true"
 	}
 
+	// OpenTelemetry skip zero values
+	if skipZero := os.Getenv("FSAGENT_OTEL_SKIP_ZERO_VALUES"); skipZero != "" {
+		cfg.OpenTelemetry.SkipZeroValues = skipZero == "true"
+	}
+
 	// HTTP port
 	if port := os.Getenv("FSAGENT_HTTP_PORT"); port != "" {
 		p, err := strconv.Atoi(port)
