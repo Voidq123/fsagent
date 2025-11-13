@@ -72,7 +72,7 @@ For detailed architecture diagrams including sequence diagrams, data flow, and d
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/fsagent.git
+git clone https://github.com/luongdev/fsagent.git
 cd fsagent
 
 # Install dependencies

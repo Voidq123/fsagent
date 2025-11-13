@@ -39,12 +39,13 @@ type MetricsExporter interface {
 
 // otelExporter implements MetricsExporter interface
 type otelExporter struct {
-	config        *config.OTelConfig
-	meterProvider *sdkmetric.MeterProvider
-	meter         metric.Meter
-	batchChan     chan interface{}
-	batchInterval time.Duration
-	stopChan      chan struct{}
+	config         *config.OTelConfig
+	meterProvider  *sdkmetric.MeterProvider
+	meter          metric.Meter
+	batchChan      chan interface{}
+	batchInterval  time.Duration
+	stopChan       chan struct{}
+	skipZeroValues bool
 
 	// RTCP Metrics (real-time)
 	rtcpJitter       metric.Float64Gauge
@@ -67,10 +68,11 @@ type otelExporter struct {
 // NewMetricsExporter creates a new OpenTelemetry metrics exporter
 func NewMetricsExporter(cfg *config.OTelConfig) (MetricsExporter, error) {
 	exporter := &otelExporter{
-		config:        cfg,
-		batchChan:     make(chan interface{}, 1000),
-		batchInterval: 10 * time.Second,
-		stopChan:      make(chan struct{}),
+		config:         cfg,
+		batchChan:      make(chan interface{}, 1000),
+		batchInterval:  10 * time.Second,
+		stopChan:       make(chan struct{}),
+		skipZeroValues: cfg.SkipZeroValues,
 	}
 
 	// Initialize OTel SDK
@@ -351,20 +353,30 @@ func (e *otelExporter) recordRTCPMetrics(ctx context.Context, metrics *calculato
 		attribute.String("direction", metrics.Direction),
 	}
 
-	// Record jitter
-	e.rtcpJitter.Record(ctx, metrics.Jitter, metric.WithAttributes(attrs...))
+	// Record jitter (skip if zero and skipZeroValues is enabled)
+	if !e.skipZeroValues || metrics.Jitter != 0 {
+		e.rtcpJitter.Record(ctx, metrics.Jitter, metric.WithAttributes(attrs...))
+	}
 
-	// Record packets lost
-	e.rtcpPacketsLost.Record(ctx, int64(metrics.PacketsLost), metric.WithAttributes(attrs...))
+	// Record packets lost (skip if zero and skipZeroValues is enabled)
+	if !e.skipZeroValues || metrics.PacketsLost != 0 {
+		e.rtcpPacketsLost.Record(ctx, int64(metrics.PacketsLost), metric.WithAttributes(attrs...))
+	}
 
-	// Record fraction lost
-	e.rtcpFractionLost.Record(ctx, int64(metrics.FractionLost), metric.WithAttributes(attrs...))
+	// Record fraction lost (skip if zero and skipZeroValues is enabled)
+	if !e.skipZeroValues || metrics.FractionLost != 0 {
+		e.rtcpFractionLost.Record(ctx, int64(metrics.FractionLost), metric.WithAttributes(attrs...))
+	}
 
-	// Record packets sent (incremental)
-	e.rtcpPacketsSent.Record(ctx, metrics.PacketsSent, metric.WithAttributes(attrs...))
+	// Record packets sent (incremental) (skip if zero and skipZeroValues is enabled)
+	if !e.skipZeroValues || metrics.PacketsSent != 0 {
+		e.rtcpPacketsSent.Record(ctx, metrics.PacketsSent, metric.WithAttributes(attrs...))
+	}
 
-	// Record octets sent (incremental)
-	e.rtcpOctetsSent.Record(ctx, metrics.OctetsSent, metric.WithAttributes(attrs...))
+	// Record octets sent (incremental) (skip if zero and skipZeroValues is enabled)
+	if !e.skipZeroValues || metrics.OctetsSent != 0 {
+		e.rtcpOctetsSent.Record(ctx, metrics.OctetsSent, metric.WithAttributes(attrs...))
+	}
 
 	return nil
 }
@@ -392,27 +404,49 @@ func (e *otelExporter) recordQoSMetrics(ctx context.Context, metrics *calculator
 		attribute.String("domain_name", metrics.DomainName),
 	}
 
-	// Record MOS score with codec and endpoint info
-	mosAttrs := append(commonAttrs,
-		attribute.String("codec_name", metrics.CodecName),
-		attribute.String("src_ip", metrics.SrcIP),
-		attribute.String("dst_ip", metrics.DstIP),
-	)
-	e.qosMOS.Record(ctx, metrics.MOSScore, metric.WithAttributes(mosAttrs...))
+	// Record MOS score with codec and endpoint info (skip if zero and skipZeroValues is enabled)
+	if !e.skipZeroValues || metrics.MOSScore != 0 {
+		mosAttrs := append(commonAttrs,
+			attribute.String("codec_name", metrics.CodecName),
+			attribute.String("src_ip", metrics.SrcIP),
+			attribute.String("dst_ip", metrics.DstIP),
+		)
+		e.qosMOS.Record(ctx, metrics.MOSScore, metric.WithAttributes(mosAttrs...))
+	}
 
 	// Record jitter metrics with codec info
 	jitterAttrs := append(commonAttrs,
 		attribute.String("codec_name", metrics.CodecName),
 	)
-	e.qosAvgJitter.Record(ctx, metrics.AvgJitter, metric.WithAttributes(jitterAttrs...))
-	e.qosMinJitter.Record(ctx, metrics.MinJitter, metric.WithAttributes(jitterAttrs...))
-	e.qosMaxJitter.Record(ctx, metrics.MaxJitter, metric.WithAttributes(jitterAttrs...))
-	e.qosDelta.Record(ctx, metrics.Delta, metric.WithAttributes(jitterAttrs...))
 
-	// Record traffic metrics
-	e.qosTotalPackets.Record(ctx, metrics.TotalPackets, metric.WithAttributes(commonAttrs...))
-	e.qosPacketLoss.Record(ctx, metrics.PacketLoss, metric.WithAttributes(commonAttrs...))
-	e.qosTotalBytes.Record(ctx, metrics.TotalBytes, metric.WithAttributes(commonAttrs...))
+	if !e.skipZeroValues || metrics.AvgJitter != 0 {
+		e.qosAvgJitter.Record(ctx, metrics.AvgJitter, metric.WithAttributes(jitterAttrs...))
+	}
+
+	if !e.skipZeroValues || metrics.MinJitter != 0 {
+		e.qosMinJitter.Record(ctx, metrics.MinJitter, metric.WithAttributes(jitterAttrs...))
+	}
+
+	if !e.skipZeroValues || metrics.MaxJitter != 0 {
+		e.qosMaxJitter.Record(ctx, metrics.MaxJitter, metric.WithAttributes(jitterAttrs...))
+	}
+
+	if !e.skipZeroValues || metrics.Delta != 0 {
+		e.qosDelta.Record(ctx, metrics.Delta, metric.WithAttributes(jitterAttrs...))
+	}
+
+	// Record traffic metrics (skip if zero and skipZeroValues is enabled)
+	if !e.skipZeroValues || metrics.TotalPackets != 0 {
+		e.qosTotalPackets.Record(ctx, metrics.TotalPackets, metric.WithAttributes(commonAttrs...))
+	}
+
+	if !e.skipZeroValues || metrics.PacketLoss != 0 {
+		e.qosPacketLoss.Record(ctx, metrics.PacketLoss, metric.WithAttributes(commonAttrs...))
+	}
+
+	if !e.skipZeroValues || metrics.TotalBytes != 0 {
+		e.qosTotalBytes.Record(ctx, metrics.TotalBytes, metric.WithAttributes(commonAttrs...))
+	}
 
 	return nil
 }

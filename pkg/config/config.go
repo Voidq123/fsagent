@@ -42,9 +42,10 @@ type RedisConfig struct {
 
 // OTelConfig represents OpenTelemetry configuration
 type OTelConfig struct {
-	Endpoint string            `yaml:"endpoint"`
-	Headers  map[string]string `yaml:"headers,omitempty"`
-	Insecure bool              `yaml:"insecure"`
+	Endpoint       string            `yaml:"endpoint"`
+	Headers        map[string]string `yaml:"headers,omitempty"`
+	Insecure       bool              `yaml:"insecure"`
+	SkipZeroValues bool              `yaml:"skip_zero_values"` // Skip exporting metrics with zero values
 }
 
 // HTTPConfig represents HTTP server configuration

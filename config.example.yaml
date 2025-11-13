@@ -78,6 +78,7 @@ storage:
 opentelemetry:
   endpoint: localhost:4317       # OTLP gRPC endpoint (no http:// prefix)
   insecure: true                 # Use insecure connection (no TLS) - set to false in production
+  skip_zero_values: false        # Skip exporting metrics with zero values (reduces noise)
   
   # Optional: Custom headers for authentication
   # headers:
