@@ -7,6 +7,7 @@ import (
 
 	"github.com/luongdev/fsagent/pkg/calculator"
 	"github.com/luongdev/fsagent/pkg/config"
+	"github.com/luongdev/fsagent/pkg/logger"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
@@ -45,16 +46,19 @@ type otelExporter struct {
 	batchInterval time.Duration
 	stopChan      chan struct{}
 
-	// RTCP Metrics
+	// RTCP Metrics (real-time)
 	rtcpJitter       metric.Float64Gauge
 	rtcpPacketsLost  metric.Int64Gauge
 	rtcpFractionLost metric.Int64Gauge
+	rtcpPacketsSent  metric.Int64Gauge
+	rtcpOctetsSent   metric.Int64Gauge
 
-	// QoS Metrics
+	// QoS Metrics (end of call summary)
 	qosMOS          metric.Float64Gauge
 	qosAvgJitter    metric.Float64Gauge
-	qosMaxJitter    metric.Float64Gauge
 	qosMinJitter    metric.Float64Gauge
+	qosMaxJitter    metric.Float64Gauge
+	qosDelta        metric.Float64Gauge
 	qosTotalPackets metric.Int64Gauge
 	qosPacketLoss   metric.Int64Gauge
 	qosTotalBytes   metric.Int64Gauge
@@ -132,6 +136,11 @@ func (e *otelExporter) initOTel() error {
 	// Create meter for fsagent
 	e.meter = e.meterProvider.Meter(serviceName)
 
+	logger.InfoWithFields(map[string]interface{}{
+		"endpoint": e.config.Endpoint,
+		"insecure": e.config.Insecure,
+	}, "OpenTelemetry exporter initialized")
+
 	return nil
 }
 
@@ -162,6 +171,21 @@ func (e *otelExporter) createMetricInstruments() error {
 		return fmt.Errorf("failed to create rtcp fraction lost gauge: %w", err)
 	}
 
+	e.rtcpPacketsSent, err = e.meter.Int64Gauge("freeswitch.rtcp.packets_sent",
+		metric.WithDescription("Incremental RTCP packets sent"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create rtcp packets sent gauge: %w", err)
+	}
+
+	e.rtcpOctetsSent, err = e.meter.Int64Gauge("freeswitch.rtcp.octets_sent",
+		metric.WithDescription("Incremental RTCP octets sent"),
+		metric.WithUnit("By"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create rtcp octets sent gauge: %w", err)
+	}
+
 	// QoS Metrics
 	e.qosMOS, err = e.meter.Float64Gauge("freeswitch.qos.mos_score",
 		metric.WithDescription("Mean Opinion Score"),
@@ -171,27 +195,35 @@ func (e *otelExporter) createMetricInstruments() error {
 	}
 
 	e.qosAvgJitter, err = e.meter.Float64Gauge("freeswitch.qos.jitter_avg",
-		metric.WithDescription("Average jitter"),
+		metric.WithDescription("Average jitter (min+max)/2"),
 		metric.WithUnit("ms"),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create qos avg jitter gauge: %w", err)
 	}
 
+	e.qosMinJitter, err = e.meter.Float64Gauge("freeswitch.qos.jitter_min",
+		metric.WithDescription("Minimum jitter variance during call"),
+		metric.WithUnit("ms"),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create qos min jitter gauge: %w", err)
+	}
+
 	e.qosMaxJitter, err = e.meter.Float64Gauge("freeswitch.qos.jitter_max",
-		metric.WithDescription("Maximum jitter"),
+		metric.WithDescription("Maximum jitter variance during call"),
 		metric.WithUnit("ms"),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create qos max jitter gauge: %w", err)
 	}
 
-	e.qosMinJitter, err = e.meter.Float64Gauge("freeswitch.qos.jitter_min",
-		metric.WithDescription("Minimum jitter"),
+	e.qosDelta, err = e.meter.Float64Gauge("freeswitch.qos.delta",
+		metric.WithDescription("Mean interval between RTP packets (expected: ptime)"),
 		metric.WithUnit("ms"),
 	)
 	if err != nil {
-		return fmt.Errorf("failed to create qos min jitter gauge: %w", err)
+		return fmt.Errorf("failed to create qos delta gauge: %w", err)
 	}
 
 	e.qosTotalPackets, err = e.meter.Int64Gauge("freeswitch.qos.total_packets",
@@ -261,17 +293,35 @@ func (e *otelExporter) batchProcessor(ctx context.Context) {
 
 // processBatch processes a batch of metrics
 func (e *otelExporter) processBatch(ctx context.Context, batch []interface{}) {
+	if len(batch) == 0 {
+		return
+	}
+
+	logger.DebugWithFields(map[string]interface{}{
+		"batch_size": len(batch),
+	}, "Processing metrics batch")
+
 	for _, m := range batch {
 		switch metric := m.(type) {
 		case *calculator.RTCPMetrics:
 			if err := e.recordRTCPMetrics(ctx, metric); err != nil {
 				// Log error but continue processing
-				fmt.Printf("Error recording RTCP metrics: %v\n", err)
+				logger.ErrorWithFields(map[string]interface{}{
+					"channel_id":     metric.ChannelID,
+					"correlation_id": metric.CorrelationID,
+					"fs_instance":    metric.InstanceName,
+					"error":          err.Error(),
+				}, "Error recording RTCP metrics")
 			}
 		case *calculator.QoSMetrics:
 			if err := e.recordQoSMetrics(ctx, metric); err != nil {
 				// Log error but continue processing
-				fmt.Printf("Error recording QoS metrics: %v\n", err)
+				logger.ErrorWithFields(map[string]interface{}{
+					"channel_id":     metric.ChannelID,
+					"correlation_id": metric.CorrelationID,
+					"fs_instance":    metric.InstanceName,
+					"error":          err.Error(),
+				}, "Error recording QoS metrics")
 			}
 		}
 	}
@@ -309,6 +359,12 @@ func (e *otelExporter) recordRTCPMetrics(ctx context.Context, metrics *calculato
 
 	// Record fraction lost
 	e.rtcpFractionLost.Record(ctx, int64(metrics.FractionLost), metric.WithAttributes(attrs...))
+
+	// Record packets sent (incremental)
+	e.rtcpPacketsSent.Record(ctx, metrics.PacketsSent, metric.WithAttributes(attrs...))
+
+	// Record octets sent (incremental)
+	e.rtcpOctetsSent.Record(ctx, metrics.OctetsSent, metric.WithAttributes(attrs...))
 
 	return nil
 }
@@ -349,8 +405,9 @@ func (e *otelExporter) recordQoSMetrics(ctx context.Context, metrics *calculator
 		attribute.String("codec_name", metrics.CodecName),
 	)
 	e.qosAvgJitter.Record(ctx, metrics.AvgJitter, metric.WithAttributes(jitterAttrs...))
-	e.qosMaxJitter.Record(ctx, metrics.MaxJitter, metric.WithAttributes(jitterAttrs...))
 	e.qosMinJitter.Record(ctx, metrics.MinJitter, metric.WithAttributes(jitterAttrs...))
+	e.qosMaxJitter.Record(ctx, metrics.MaxJitter, metric.WithAttributes(jitterAttrs...))
+	e.qosDelta.Record(ctx, metrics.Delta, metric.WithAttributes(jitterAttrs...))
 
 	// Record traffic metrics
 	e.qosTotalPackets.Record(ctx, metrics.TotalPackets, metric.WithAttributes(commonAttrs...))
@@ -362,6 +419,8 @@ func (e *otelExporter) recordQoSMetrics(ctx context.Context, metrics *calculator
 
 // Stop flushes and stops exporter
 func (e *otelExporter) Stop(ctx context.Context) error {
+	logger.Info("Stopping metrics exporter, flushing remaining metrics")
+
 	// Signal batch processor to stop
 	close(e.stopChan)
 
@@ -370,8 +429,12 @@ func (e *otelExporter) Stop(ctx context.Context) error {
 
 	// Shutdown meter provider (this will flush remaining metrics)
 	if err := e.meterProvider.Shutdown(ctx); err != nil {
+		logger.ErrorWithFields(map[string]interface{}{
+			"error": err.Error(),
+		}, "Failed to shutdown meter provider")
 		return fmt.Errorf("failed to shutdown meter provider: %w", err)
 	}
 
+	logger.Info("Metrics exporter stopped successfully")
 	return nil
 }

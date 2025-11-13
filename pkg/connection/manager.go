@@ -9,6 +9,7 @@ import (
 	"github.com/cgrates/fsock"
 	"github.com/luongdev/fsagent/pkg/config"
 	"github.com/luongdev/fsagent/pkg/logger"
+	"github.com/luongdev/fsagent/pkg/metrics"
 )
 
 // ConnectionManager manages ESL connections to multiple FreeSWITCH instances
@@ -56,10 +57,12 @@ type FSConnection struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	connErr     chan error
+	rtcpEnabled bool
+	qosEnabled  bool
 }
 
 // NewFSConnection creates a new FSConnection instance
-func NewFSConnection(cfg config.FSConfig) *FSConnection {
+func NewFSConnection(cfg config.FSConfig, rtcpEnabled bool, qosEnabled bool) *FSConnection {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &FSConnection{
 		config:      cfg,
@@ -70,8 +73,10 @@ func NewFSConnection(cfg config.FSConfig) *FSConnection {
 			InstanceName: cfg.Name,
 			Connected:    false,
 		},
-		ctx:    ctx,
-		cancel: cancel,
+		ctx:         ctx,
+		cancel:      cancel,
+		rtcpEnabled: rtcpEnabled,
+		qosEnabled:  qosEnabled,
 	}
 }
 
@@ -86,15 +91,22 @@ func (fc *FSConnection) Connect() error {
 	// Event handlers map: event name -> list of handler functions
 	eventHandlers := make(map[string][]func(string, int))
 
-	// Register handler for all events we care about
+	// Build event list based on enabled features
 	events := []string{
 		"CHANNEL_CREATE",
 		"CHANNEL_PROGRESS_MEDIA",
 		"CHANNEL_BRIDGE",
 		"CHANNEL_ANSWER",
-		"CHANNEL_DESTROY",
-		"RECV_RTCP_MESSAGE",
-		"SEND_RTCP_MESSAGE",
+	}
+
+	// Only subscribe to CHANNEL_DESTROY if QoS is enabled
+	if fc.qosEnabled {
+		events = append(events, "CHANNEL_DESTROY")
+	}
+
+	// Only subscribe to RTCP events if RTCP is enabled
+	if fc.rtcpEnabled {
+		events = append(events, "RECV_RTCP_MESSAGE", "SEND_RTCP_MESSAGE")
 	}
 
 	for _, eventName := range events {
@@ -133,7 +145,15 @@ func (fc *FSConnection) Connect() error {
 	fc.status.LastError = nil
 	fc.status.LastEventAt = time.Now()
 
-	logger.Info("Successfully connected to FreeSWITCH instance: %s at %s", fc.config.Name, addr)
+	logger.InfoWithFields(map[string]interface{}{
+		"fs_instance": fc.config.Name,
+		"address":     addr,
+		"rtcp":        fc.rtcpEnabled,
+		"qos":         fc.qosEnabled,
+	}, "Successfully connected to FreeSWITCH instance")
+
+	// Update connection metrics
+	metrics.GetMetrics().SetFSConnectionStatus(fc.config.Name, true)
 
 	return nil
 }
@@ -176,7 +196,9 @@ func (fc *FSConnection) eventHandler(eventBody string, connIdx int) {
 		return
 	default:
 		// Channel is full, log warning
-		logger.Warn("Event channel full for instance %s, dropping event", fc.config.Name)
+		logger.WarnWithFields(map[string]interface{}{
+			"fs_instance": fc.config.Name,
+		}, "Event channel full, dropping event")
 	}
 }
 
@@ -217,12 +239,17 @@ func (fc *FSConnection) keepaliveLoop() {
 
 			// If we received events recently, skip keepalive
 			if time.Since(lastEventAt) < 10*time.Second {
-				logger.Debug("Skipping keepalive for instance %s (recent activity)", fc.config.Name)
+				logger.DebugWithFields(map[string]interface{}{
+					"fs_instance": fc.config.Name,
+				}, "Skipping keepalive (recent activity)")
 				continue
 			}
 
 			if err := fc.sendKeepalive(); err != nil {
-				logger.Warn("Keepalive failed for instance %s: %v", fc.config.Name, err)
+				logger.WarnWithFields(map[string]interface{}{
+					"fs_instance": fc.config.Name,
+					"error":       err.Error(),
+				}, "Keepalive failed")
 				// Connection might be dead, trigger reconnection
 				select {
 				case fc.reconnectCh <- struct{}{}:
@@ -254,6 +281,10 @@ func (fc *FSConnection) sendKeepalive() error {
 		fc.status.LastError = fmt.Errorf("keepalive failed: %w", err)
 		fc.status.Connected = false
 		fc.mu.Unlock()
+
+		// Update connection metrics
+		metrics.GetMetrics().SetFSConnectionStatus(fc.config.Name, false)
+
 		return err
 	}
 
@@ -262,7 +293,9 @@ func (fc *FSConnection) sendKeepalive() error {
 	fc.status.LastEventAt = time.Now()
 	fc.mu.Unlock()
 
-	logger.Debug("Keepalive sent successfully to instance %s", fc.config.Name)
+	logger.DebugWithFields(map[string]interface{}{
+		"fs_instance": fc.config.Name,
+	}, "Keepalive sent successfully")
 
 	return nil
 }
@@ -289,7 +322,9 @@ func (fc *FSConnection) reconnectionLoop() {
 		select {
 		case <-fc.reconnectCh:
 			// Reconnection triggered
-			logger.Info("Reconnection triggered for instance %s", fc.config.Name)
+			logger.InfoWithFields(map[string]interface{}{
+				"fs_instance": fc.config.Name,
+			}, "Reconnection triggered")
 
 			// Close existing connection if any
 			fc.mu.Lock()
@@ -300,20 +335,29 @@ func (fc *FSConnection) reconnectionLoop() {
 			fc.status.Connected = false
 			fc.mu.Unlock()
 
+			// Update connection metrics
+			metrics.GetMetrics().SetFSConnectionStatus(fc.config.Name, false)
+
 			// Attempt reconnection with exponential backoff
 			reconnected := false
 			for !reconnected {
 				backoffDuration := backoffDurations[backoffIndex]
-				logger.Info("Attempting to reconnect to instance %s in %v (attempt %d)",
-					fc.config.Name, backoffDuration, backoffIndex+1)
+				logger.InfoWithFields(map[string]interface{}{
+					"fs_instance": fc.config.Name,
+					"backoff":     backoffDuration.String(),
+					"attempt":     backoffIndex + 1,
+				}, "Attempting to reconnect")
 
 				// Wait for backoff duration
 				select {
 				case <-time.After(backoffDuration):
 					// Try to reconnect
 					if err := fc.Connect(); err != nil {
-						logger.Warn("Reconnection attempt %d failed for instance %s: %v",
-							backoffIndex+1, fc.config.Name, err)
+						logger.WarnWithFields(map[string]interface{}{
+							"fs_instance": fc.config.Name,
+							"attempt":     backoffIndex + 1,
+							"error":       err.Error(),
+						}, "Reconnection attempt failed")
 
 						// Increase backoff index, but cap at max
 						if backoffIndex < len(backoffDurations)-1 {
@@ -323,7 +367,9 @@ func (fc *FSConnection) reconnectionLoop() {
 					}
 
 					// Reconnection successful
-					logger.Info("Successfully reconnected to instance %s", fc.config.Name)
+					logger.InfoWithFields(map[string]interface{}{
+						"fs_instance": fc.config.Name,
+					}, "Successfully reconnected")
 					backoffIndex = 0 // Reset backoff on successful connection
 
 					// Restart keepalive
@@ -360,7 +406,9 @@ func (fc *FSConnection) Close() error {
 	close(fc.eventChan)
 	fc.status.Connected = false
 
-	logger.Info("Closed connection to FreeSWITCH instance: %s", fc.config.Name)
+	logger.InfoWithFields(map[string]interface{}{
+		"fs_instance": fc.config.Name,
+	}, "Closed connection to FreeSWITCH instance")
 
 	return nil
 }
@@ -380,12 +428,12 @@ type DefaultConnectionManager struct {
 }
 
 // NewConnectionManager creates a new ConnectionManager instance
-func NewConnectionManager(configs []config.FSConfig) ConnectionManager {
+func NewConnectionManager(configs []config.FSConfig, rtcpEnabled bool, qosEnabled bool) ConnectionManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	connections := make([]*FSConnection, 0, len(configs))
 	for _, cfg := range configs {
-		conn := NewFSConnection(cfg)
+		conn := NewFSConnection(cfg, rtcpEnabled, qosEnabled)
 		connections = append(connections, conn)
 	}
 
@@ -420,11 +468,16 @@ func (cm *DefaultConnectionManager) Start(ctx context.Context) error {
 
 			// Attempt initial connection
 			if err := c.Connect(); err != nil {
-				logger.Warn("Initial connection failed for instance %s: %v", c.config.Name, err)
+				logger.WarnWithFields(map[string]interface{}{
+					"fs_instance": c.config.Name,
+					"error":       err.Error(),
+				}, "Initial connection failed")
 				errChan <- fmt.Errorf("failed to connect to %s: %w", c.config.Name, err)
 				// Don't return - we'll start reconnection loop anyway
 			} else {
-				logger.Info("Initial connection successful for instance %s", c.config.Name)
+				logger.InfoWithFields(map[string]interface{}{
+					"fs_instance": c.config.Name,
+				}, "Initial connection successful")
 			}
 
 			// Start keepalive mechanism
@@ -455,11 +508,15 @@ func (cm *DefaultConnectionManager) Start(ctx context.Context) error {
 
 	// Log warnings for partial failures
 	if len(errors) > 0 {
-		logger.Warn("%d out of %d connections failed initially, will retry",
-			len(errors), len(cm.connections))
+		logger.WarnWithFields(map[string]interface{}{
+			"failed_count": len(errors),
+			"total_count":  len(cm.connections),
+		}, "Some connections failed initially, will retry")
 	}
 
-	logger.Info("ConnectionManager started with %d FreeSWITCH instances", len(cm.connections))
+	logger.InfoWithFields(map[string]interface{}{
+		"instance_count": len(cm.connections),
+	}, "ConnectionManager started")
 	return nil
 }
 
@@ -469,14 +526,18 @@ func (cm *DefaultConnectionManager) startEventForwarding(conn *FSConnection) {
 		instanceName := conn.config.Name
 		eventChan := conn.GetEventChannel()
 
-		logger.Debug("Started event forwarding for instance %s", instanceName)
+		logger.DebugWithFields(map[string]interface{}{
+			"fs_instance": instanceName,
+		}, "Started event forwarding")
 
 		for {
 			select {
 			case event, ok := <-eventChan:
 				if !ok {
 					// Channel closed, connection is shutting down
-					logger.Info("Event channel closed for instance %s", instanceName)
+					logger.InfoWithFields(map[string]interface{}{
+						"fs_instance": instanceName,
+					}, "Event channel closed")
 					return
 				}
 
@@ -487,15 +548,22 @@ func (cm *DefaultConnectionManager) startEventForwarding(conn *FSConnection) {
 
 				if forwarder != nil {
 					if err := forwarder.ProcessEvent(cm.ctx, event, instanceName); err != nil {
-						logger.Error("Error processing event from instance %s: %v", instanceName, err)
+						logger.ErrorWithFields(map[string]interface{}{
+							"fs_instance": instanceName,
+							"error":       err.Error(),
+						}, "Error processing event")
 					}
 				} else {
-					logger.Warn("No event forwarder configured, dropping event from instance %s", instanceName)
+					logger.WarnWithFields(map[string]interface{}{
+						"fs_instance": instanceName,
+					}, "No event forwarder configured, dropping event")
 				}
 
 			case <-cm.ctx.Done():
 				// Connection manager is shutting down
-				logger.Info("Stopping event forwarding for instance %s", instanceName)
+				logger.InfoWithFields(map[string]interface{}{
+					"fs_instance": instanceName,
+				}, "Stopping event forwarding")
 				return
 			}
 		}
@@ -515,7 +583,10 @@ func (cm *DefaultConnectionManager) Stop() error {
 		go func(c *FSConnection) {
 			defer wg.Done()
 			if err := c.Close(); err != nil {
-				logger.Error("Error closing connection to %s: %v", c.config.Name, err)
+				logger.ErrorWithFields(map[string]interface{}{
+					"fs_instance": c.config.Name,
+					"error":       err.Error(),
+				}, "Error closing connection")
 			}
 		}(conn)
 	}

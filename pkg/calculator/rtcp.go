@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/luongdev/fsagent/pkg/connection"
+	"github.com/luongdev/fsagent/pkg/logger"
 	"github.com/luongdev/fsagent/pkg/store"
 )
 
@@ -70,6 +71,12 @@ func (rc *rtcpCalculator) CalculateMetrics(ctx context.Context, event *connectio
 	// Get channel state
 	state, err := rc.store.Get(ctx, channelID)
 	if err != nil {
+		logger.ErrorWithFields(map[string]interface{}{
+			"channel_id":  channelID,
+			"fs_instance": instanceName,
+			"direction":   direction,
+			"error":       err.Error(),
+		}, "Failed to get channel state for RTCP calculation")
 		return nil, fmt.Errorf("failed to get channel state: %w", err)
 	}
 
@@ -108,8 +115,24 @@ func (rc *rtcpCalculator) CalculateMetrics(ctx context.Context, event *connectio
 
 	// Update state with new cumulative values
 	if err := rc.updateState(ctx, channelID, state, metrics, direction); err != nil {
+		logger.ErrorWithFields(map[string]interface{}{
+			"channel_id":     channelID,
+			"correlation_id": metrics.CorrelationID,
+			"fs_instance":    instanceName,
+			"direction":      direction,
+			"error":          err.Error(),
+		}, "Failed to update state after RTCP calculation")
 		return nil, fmt.Errorf("failed to update state: %w", err)
 	}
+
+	logger.DebugWithFields(map[string]interface{}{
+		"channel_id":     channelID,
+		"correlation_id": metrics.CorrelationID,
+		"fs_instance":    instanceName,
+		"direction":      direction,
+		"jitter_ms":      metrics.Jitter,
+		"packets_lost":   metrics.PacketsLost,
+	}, "RTCP metrics calculated successfully")
 
 	return metrics, nil
 }

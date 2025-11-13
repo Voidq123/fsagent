@@ -10,6 +10,7 @@ import (
 	"github.com/luongdev/fsagent/pkg/connection"
 	"github.com/luongdev/fsagent/pkg/exporter"
 	"github.com/luongdev/fsagent/pkg/logger"
+	"github.com/luongdev/fsagent/pkg/metrics"
 	"github.com/luongdev/fsagent/pkg/store"
 )
 
@@ -31,15 +32,19 @@ type eventProcessor struct {
 	rtcpCalculator calculator.RTCPCalculator
 	qosCalculator  calculator.QoSCalculator
 	exporter       exporter.MetricsExporter
+	rtcpEnabled    bool
+	qosEnabled     bool
 }
 
 // NewEventProcessor creates a new event processor
-func NewEventProcessor(store store.StateStore, rtcpCalculator calculator.RTCPCalculator, qosCalculator calculator.QoSCalculator, metricsExporter exporter.MetricsExporter) EventProcessor {
+func NewEventProcessor(store store.StateStore, rtcpCalculator calculator.RTCPCalculator, qosCalculator calculator.QoSCalculator, metricsExporter exporter.MetricsExporter, rtcpEnabled bool, qosEnabled bool) EventProcessor {
 	return &eventProcessor{
 		store:          store,
 		rtcpCalculator: rtcpCalculator,
 		qosCalculator:  qosCalculator,
 		exporter:       metricsExporter,
+		rtcpEnabled:    rtcpEnabled,
+		qosEnabled:     qosEnabled,
 	}
 }
 
@@ -86,58 +91,92 @@ func (ep *eventProcessor) ProcessEvent(ctx context.Context, event interface{}, i
 		return fmt.Errorf("event missing Event-Name header")
 	}
 
-	logger.Debug("Processing event: %s from instance: %s", eventName, instanceName)
+	// Increment events received counter
+	m := metrics.GetMetrics()
+	m.IncrementEventsReceived(instanceName, eventName)
+
+	logger.DebugWithFields(map[string]interface{}{
+		"fs_instance": instanceName,
+		"event_type":  eventName,
+	}, "Processing event")
 
 	// Route to appropriate handler based on event type
+	var err error
 	switch eventName {
 	case "CHANNEL_CREATE":
-		return ep.handleChannelCreate(ctx, fsEvent, instanceName)
+		err = ep.handleChannelCreate(ctx, fsEvent, instanceName)
 	case "CHANNEL_PROGRESS_MEDIA":
-		return ep.handleChannelProgressMedia(ctx, fsEvent, instanceName)
+		err = ep.handleChannelProgressMedia(ctx, fsEvent, instanceName)
 	case "CHANNEL_BRIDGE":
-		return ep.handleChannelBridge(ctx, fsEvent, instanceName)
+		err = ep.handleChannelBridge(ctx, fsEvent, instanceName)
 	case "CHANNEL_ANSWER":
-		return ep.handleChannelAnswer(ctx, fsEvent, instanceName)
+		err = ep.handleChannelAnswer(ctx, fsEvent, instanceName)
 	case "CHANNEL_DESTROY":
-		return ep.handleChannelDestroy(ctx, fsEvent, instanceName)
+		err = ep.handleChannelDestroy(ctx, fsEvent, instanceName)
 	case "RECV_RTCP_MESSAGE":
-		return ep.handleRTCPMessage(ctx, fsEvent, instanceName, "inbound")
+		if ep.rtcpEnabled {
+			err = ep.handleRTCPMessage(ctx, fsEvent, instanceName, "inbound")
+		}
 	case "SEND_RTCP_MESSAGE":
-		return ep.handleRTCPMessage(ctx, fsEvent, instanceName, "outbound")
+		if ep.rtcpEnabled {
+			err = ep.handleRTCPMessage(ctx, fsEvent, instanceName, "outbound")
+		}
 	default:
 		// Unknown event type - log and skip
-		logger.Debug("Skipping unknown event type: %s", eventName)
+		logger.DebugWithFields(map[string]interface{}{
+			"fs_instance": instanceName,
+			"event_type":  eventName,
+		}, "Skipping unknown event type")
 		return nil
 	}
+
+	// Increment events processed counter if successful
+	if err == nil {
+		m.IncrementEventsProcessed(instanceName, eventName)
+	}
+
+	return err
 }
 
 // extractCorrelationID extracts correlation ID with fallback priority
 func (ep *eventProcessor) extractCorrelationID(event *connection.FSEvent) string {
 	// Priority 1: Other-Leg-Unique-ID (B-leg)
 	if correlationID := event.GetHeader("Other-Leg-Unique-ID"); correlationID != "" {
-		logger.Debug("🔗 Correlation ID from Other-Leg-Unique-ID: %s", correlationID)
+		logger.DebugWithFields(map[string]interface{}{
+			"correlation_id": correlationID,
+			"source":         "Other-Leg-Unique-ID",
+		}, "Extracted correlation ID")
 		return correlationID
 	}
 
 	// Priority 2: Unique-ID (A-leg)
 	if correlationID := event.GetHeader("Unique-ID"); correlationID != "" {
-		logger.Debug("🔗 Correlation ID from Unique-ID: %s", correlationID)
+		logger.DebugWithFields(map[string]interface{}{
+			"correlation_id": correlationID,
+			"source":         "Unique-ID",
+		}, "Extracted correlation ID")
 		return correlationID
 	}
 
 	// Priority 3: variable_sip_call_id
 	if correlationID := event.GetHeader("variable_sip_call_id"); correlationID != "" {
-		logger.Debug("🔗 Correlation ID from variable_sip_call_id: %s", correlationID)
+		logger.DebugWithFields(map[string]interface{}{
+			"correlation_id": correlationID,
+			"source":         "variable_sip_call_id",
+		}, "Extracted correlation ID")
 		return correlationID
 	}
 
 	// Priority 4: variable_global_call_id
 	if correlationID := event.GetHeader("variable_global_call_id"); correlationID != "" {
-		logger.Debug("🔗 Correlation ID from variable_global_call_id: %s", correlationID)
+		logger.DebugWithFields(map[string]interface{}{
+			"correlation_id": correlationID,
+			"source":         "variable_global_call_id",
+		}, "Extracted correlation ID")
 		return correlationID
 	}
 
-	logger.Debug("⚠️  No correlation ID found in event headers")
+	logger.Debug("No correlation ID found in event headers")
 	return ""
 }
 
@@ -188,11 +227,12 @@ func (ep *eventProcessor) handleChannelCreate(ctx context.Context, event *connec
 		return fmt.Errorf("failed to store channel state: %w", err)
 	}
 
-	if correlationID == "" {
-		logger.Debug("⚠️  Created channel state: channel_id=%s, correlation_id=<EMPTY>, domain=%s", channelID, domainName)
-	} else {
-		logger.Debug("✅ Created channel state: channel_id=%s, correlation_id=%s, domain=%s", channelID, correlationID, domainName)
-	}
+	logger.DebugWithFields(map[string]interface{}{
+		"channel_id":     channelID,
+		"correlation_id": correlationID,
+		"domain_name":    domainName,
+		"fs_instance":    instanceName,
+	}, "Created channel state")
 	return nil
 }
 
@@ -260,8 +300,15 @@ func (ep *eventProcessor) updateMediaInfo(ctx context.Context, event *connection
 		return fmt.Errorf("failed to update channel state: %w", err)
 	}
 
-	logger.Debug("📡 Updated media info: channel_id=%s, correlation_id=%s, local=%s:%d, remote=%s:%d",
-		channelID, state.CorrelationID, state.LocalMediaIP, state.LocalMediaPort, state.RemoteMediaIP, state.RemoteMediaPort)
+	logger.DebugWithFields(map[string]interface{}{
+		"channel_id":        channelID,
+		"correlation_id":    state.CorrelationID,
+		"fs_instance":       instanceName,
+		"local_media_ip":    state.LocalMediaIP,
+		"local_media_port":  state.LocalMediaPort,
+		"remote_media_ip":   state.RemoteMediaIP,
+		"remote_media_port": state.RemoteMediaPort,
+	}, "Updated media info")
 	return nil
 }
 
@@ -272,20 +319,40 @@ func (ep *eventProcessor) handleChannelDestroy(ctx context.Context, event *conne
 		return fmt.Errorf("CHANNEL_DESTROY event missing Unique-ID")
 	}
 
-	// Calculate QoS metrics if calculator is available and codec rate is present
-	if ep.qosCalculator != nil && event.GetHeader("variable_rtp_use_codec_rate") != "" {
-		metrics, err := ep.qosCalculator.CalculateMetrics(ctx, event, instanceName)
+	// Calculate QoS metrics if enabled, calculator is available and codec rate is present
+	if ep.qosEnabled && ep.qosCalculator != nil && event.GetHeader("variable_rtp_use_codec_rate") != "" {
+		qosMetrics, err := ep.qosCalculator.CalculateMetrics(ctx, event, instanceName)
 		if err != nil {
-			logger.Error("Error calculating QoS metrics: %v", err)
+			logger.ErrorWithFields(map[string]interface{}{
+				"channel_id":  channelID,
+				"fs_instance": instanceName,
+				"error":       err.Error(),
+			}, "Error calculating QoS metrics")
 		} else {
+			// Increment QoS messages generated counter
+			m := metrics.GetMetrics()
+			m.IncrementQoSMessagesGenerated(instanceName)
+
 			// Export QoS metrics
 			if ep.exporter != nil {
-				if err := ep.exporter.ExportQoS(ctx, metrics); err != nil {
-					logger.Error("Error exporting QoS metrics: %v", err)
+				if err := ep.exporter.ExportQoS(ctx, qosMetrics); err != nil {
+					logger.ErrorWithFields(map[string]interface{}{
+						"channel_id":     channelID,
+						"correlation_id": qosMetrics.CorrelationID,
+						"fs_instance":    instanceName,
+						"error":          err.Error(),
+					}, "Error exporting QoS metrics")
 				}
 			}
-			logger.Info("📊 QoS metrics: channel_id=%s, correlation_id=%s, domain=%s, mos=%.2f, avg_jitter=%.2fms, packet_loss=%d",
-				metrics.ChannelID, metrics.CorrelationID, metrics.DomainName, metrics.MOSScore, metrics.AvgJitter, metrics.PacketLoss)
+			logger.InfoWithFields(map[string]interface{}{
+				"channel_id":     qosMetrics.ChannelID,
+				"correlation_id": qosMetrics.CorrelationID,
+				"domain_name":    qosMetrics.DomainName,
+				"fs_instance":    instanceName,
+				"mos_score":      qosMetrics.MOSScore,
+				"avg_jitter_ms":  qosMetrics.AvgJitter,
+				"packet_loss":    qosMetrics.PacketLoss,
+			}, "QoS metrics calculated")
 		}
 	} else {
 		// Get channel state to log correlation_id before deletion
@@ -294,7 +361,11 @@ func (ep *eventProcessor) handleChannelDestroy(ctx context.Context, event *conne
 		if err == nil && state != nil {
 			correlationID = state.CorrelationID
 		}
-		logger.Info("🔚 Channel destroyed: channel_id=%s, correlation_id=%s, instance=%s", channelID, correlationID, instanceName)
+		logger.InfoWithFields(map[string]interface{}{
+			"channel_id":     channelID,
+			"correlation_id": correlationID,
+			"fs_instance":    instanceName,
+		}, "Channel destroyed")
 	}
 
 	return nil
@@ -309,21 +380,43 @@ func (ep *eventProcessor) handleRTCPMessage(ctx context.Context, event *connecti
 
 	// Calculate RTCP metrics if calculator is available
 	if ep.rtcpCalculator != nil {
-		metrics, err := ep.rtcpCalculator.CalculateMetrics(ctx, event, direction, instanceName)
+		rtcpMetrics, err := ep.rtcpCalculator.CalculateMetrics(ctx, event, direction, instanceName)
 		if err != nil {
-			logger.Error("Error calculating RTCP metrics: %v", err)
+			logger.ErrorWithFields(map[string]interface{}{
+				"channel_id":  channelID,
+				"fs_instance": instanceName,
+				"direction":   direction,
+				"error":       err.Error(),
+			}, "Error calculating RTCP metrics")
 			return err
 		}
 
+		// Increment RTCP messages processed counter
+		m := metrics.GetMetrics()
+		m.IncrementRTCPMessagesProcessed(instanceName, direction)
+
 		// Export metrics to OTel
 		if ep.exporter != nil {
-			if err := ep.exporter.ExportRTCP(ctx, metrics); err != nil {
-				logger.Error("Error exporting RTCP metrics: %v", err)
+			if err := ep.exporter.ExportRTCP(ctx, rtcpMetrics); err != nil {
+				logger.ErrorWithFields(map[string]interface{}{
+					"channel_id":     channelID,
+					"correlation_id": rtcpMetrics.CorrelationID,
+					"fs_instance":    instanceName,
+					"direction":      direction,
+					"error":          err.Error(),
+				}, "Error exporting RTCP metrics")
 			}
 		}
 
-		logger.Info("📊 RTCP metrics: channel_id=%s, correlation_id=%s, domain=%s, direction=%s, jitter=%.2fms, packets_lost=%d",
-			metrics.ChannelID, metrics.CorrelationID, metrics.DomainName, metrics.Direction, metrics.Jitter, metrics.PacketsLost)
+		logger.DebugWithFields(map[string]interface{}{
+			"channel_id":     rtcpMetrics.ChannelID,
+			"correlation_id": rtcpMetrics.CorrelationID,
+			"domain_name":    rtcpMetrics.DomainName,
+			"fs_instance":    instanceName,
+			"direction":      rtcpMetrics.Direction,
+			"jitter_ms":      rtcpMetrics.Jitter,
+			"packets_lost":   rtcpMetrics.PacketsLost,
+		}, "RTCP metrics calculated")
 	} else {
 		// Get channel state to log correlation_id
 		state, err := ep.store.Get(ctx, channelID)
@@ -332,8 +425,12 @@ func (ep *eventProcessor) handleRTCPMessage(ctx context.Context, event *connecti
 			correlationID = state.CorrelationID
 		}
 
-		logger.Debug("📊 RTCP message: channel_id=%s, correlation_id=%s, direction=%s, instance=%s",
-			channelID, correlationID, direction, instanceName)
+		logger.DebugWithFields(map[string]interface{}{
+			"channel_id":     channelID,
+			"correlation_id": correlationID,
+			"fs_instance":    instanceName,
+			"direction":      direction,
+		}, "RTCP message received")
 	}
 
 	return nil

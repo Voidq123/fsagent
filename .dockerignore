@@ -1,0 +1,31 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+fsagent
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test files
+*_test.go
+testdata/
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Documentation
+README.md
+*.md
+
+# Config files (except example)
+config.yaml
+
+# Misc
+.DS_Store

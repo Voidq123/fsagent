@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/luongdev/fsagent/pkg/connection"
+	"github.com/luongdev/fsagent/pkg/logger"
 	"github.com/luongdev/fsagent/pkg/store"
 )
 
@@ -85,23 +86,57 @@ func (qc *qosCalculator) CalculateMetrics(ctx context.Context, event *connection
 
 	// Extract MOS score
 	if err := qc.extractQualityMetrics(event, metrics); err != nil {
+		logger.ErrorWithFields(map[string]interface{}{
+			"channel_id":  channelID,
+			"fs_instance": instanceName,
+			"error":       err.Error(),
+		}, "Failed to extract quality metrics")
 		return nil, fmt.Errorf("failed to extract quality metrics: %w", err)
 	}
 
 	// Extract traffic metrics
 	if err := qc.extractTrafficMetrics(event, metrics); err != nil {
+		logger.ErrorWithFields(map[string]interface{}{
+			"channel_id":  channelID,
+			"fs_instance": instanceName,
+			"error":       err.Error(),
+		}, "Failed to extract traffic metrics")
 		return nil, fmt.Errorf("failed to extract traffic metrics: %w", err)
 	}
 
 	// Extract codec information
 	if err := qc.extractCodecInfo(event, metrics); err != nil {
+		logger.ErrorWithFields(map[string]interface{}{
+			"channel_id":  channelID,
+			"fs_instance": instanceName,
+			"error":       err.Error(),
+		}, "Failed to extract codec info")
 		return nil, fmt.Errorf("failed to extract codec info: %w", err)
 	}
 
 	// Retrieve correlation_id and domain_name from state, or extract from event
 	if err := qc.extractStateAndDomain(ctx, event, metrics); err != nil {
+		logger.ErrorWithFields(map[string]interface{}{
+			"channel_id":  channelID,
+			"fs_instance": instanceName,
+			"error":       err.Error(),
+		}, "Failed to extract state and domain")
 		return nil, fmt.Errorf("failed to extract state and domain: %w", err)
 	}
+
+	logger.DebugWithFields(map[string]interface{}{
+		"channel_id":     channelID,
+		"correlation_id": metrics.CorrelationID,
+		"fs_instance":    instanceName,
+		"mos_score":      metrics.MOSScore,
+		"avg_jitter_ms":  metrics.AvgJitter,
+		"min_jitter_ms":  metrics.MinJitter,
+		"max_jitter_ms":  metrics.MaxJitter,
+		"delta_ms":       metrics.Delta,
+		"packet_loss":    metrics.PacketLoss,
+		"total_packets":  metrics.TotalPackets,
+		"codec_name":     metrics.CodecName,
+	}, "QoS metrics calculated successfully")
 
 	return metrics, nil
 }
@@ -278,7 +313,11 @@ func (qc *qosCalculator) extractStateAndDomain(ctx context.Context, event *conne
 		// Delete channel state after metrics calculation
 		if delErr := qc.store.Delete(ctx, channelID); delErr != nil {
 			// Log warning but don't fail - metrics are already calculated
-			// The error will be logged by the caller
+			logger.WarnWithFields(map[string]interface{}{
+				"channel_id":     channelID,
+				"correlation_id": metrics.CorrelationID,
+				"error":          delErr.Error(),
+			}, "Failed to delete channel state after QoS calculation")
 		}
 
 		return nil

@@ -1,26 +1,217 @@
+# FSAgent Configuration Example
+# 
+# This file demonstrates all available configuration options for FSAgent.
+# Copy this file to config.yaml and adjust values for your environment.
+#
+# Configuration can also be provided via environment variables with FSAGENT_ prefix:
+# - FSAGENT_FREESWITCH_INSTANCES (JSON array)
+# - FSAGENT_STORAGE_TYPE (memory|redis)
+# - FSAGENT_REDIS_HOST, FSAGENT_REDIS_PORT, etc.
+# - FSAGENT_OTEL_ENDPOINT
+# - FSAGENT_HTTP_PORT
+# - FSAGENT_LOG_LEVEL, FSAGENT_LOG_FORMAT
+
+# ============================================================================
+# FreeSWITCH Instances Configuration
+# ============================================================================
+# Define one or more FreeSWITCH instances to monitor.
+# FSAgent will connect to all instances concurrently via ESL.
+
 freeswitch_instances:
-  - name: fs1
-    host: 192.168.13.137
+  # Example 1: Single FreeSWITCH instance
+  - name: fs1                    # Unique identifier for this instance (used in metrics labels)
+    host: 192.168.1.10           # FreeSWITCH ESL host
+    port: 8021                   # FreeSWITCH ESL port (default: 8021)
+    password: ClueCon            # ESL password (set in fs_cli: event_socket_password)
+  
+  # Example 2: Multiple FreeSWITCH instances
+  - name: fs2
+    host: 192.168.1.11
     port: 8021
     password: ClueCon
+  
+  # Example 3: Remote FreeSWITCH with custom port
+  # - name: fs-prod-01
+  #   host: freeswitch.example.com
+  #   port: 8021
+  #   password: SecurePassword123
+
+# ============================================================================
+# Storage Configuration
+# ============================================================================
+# FSAgent stores channel state to correlate events and calculate incremental metrics.
+# Two storage backends are supported: in-memory (fast, volatile) and Redis (persistent).
 
 storage:
-  type: redis  # "memory" or "redis"
+  type: memory  # Options: "memory" or "redis"
+  
+  # In-Memory Storage (Default)
+  # - Pros: Fast, no external dependencies, low latency
+  # - Cons: Data lost on restart, not suitable for multi-instance deployments
+  # - Use case: Single FSAgent instance, development, testing
+  
+  # Redis Storage (Recommended for Production)
+  # - Pros: Persistent, supports multiple FSAgent instances, survives restarts
+  # - Cons: Requires Redis server, slight network latency
+  # - Use case: Production deployments, high availability setups
   redis:
-    host: localhost
-    port: 6379
-    password: ""
-    db: 0
+    host: localhost              # Redis server host
+    port: 6379                   # Redis server port
+    password: ""                 # Redis password (leave empty if no auth)
+    db: 0                        # Redis database number (0-15)
+    # TTL for channel state: 24 hours (86400 seconds) - automatically cleaned up
+
+# Example: Redis with authentication
+# storage:
+#   type: redis
+#   redis:
+#     host: redis.example.com
+#     port: 6379
+#     password: "RedisSecurePassword"
+#     db: 1
+
+# ============================================================================
+# OpenTelemetry Configuration
+# ============================================================================
+# FSAgent exports metrics to OpenTelemetry Collector using OTLP/gRPC protocol.
 
 opentelemetry:
-  endpoint: localhost:4317
-  insecure: true
-  headers:
-    x-api-key: "your-api-key"
+  endpoint: localhost:4317       # OTLP gRPC endpoint (no http:// prefix)
+  insecure: true                 # Use insecure connection (no TLS) - set to false in production
+  
+  # Optional: Custom headers for authentication
+  # headers:
+  #   x-api-key: "your-api-key"
+  #   authorization: "Bearer token123"
+
+# Example: Production OTel Collector with TLS
+# opentelemetry:
+#   endpoint: otel-collector.example.com:4317
+#   insecure: false
+#   headers:
+#     x-api-key: "prod-api-key-12345"
+
+# ============================================================================
+# HTTP Server Configuration
+# ============================================================================
+# FSAgent exposes HTTP endpoints for health checks and internal metrics.
 
 http:
-  port: 8080
+  port: 8080                     # HTTP server port
+
+# Available endpoints:
+# - GET /health  - Connection status for all FreeSWITCH instances
+# - GET /ready   - Readiness probe (200 if at least one FS connected)
+# - GET /metrics - Prometheus-format internal metrics
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+# Configure structured logging output.
 
 logging:
-  level: info  # debug, info, warn, error
-  format: json # json, text
+  level: info                    # Options: debug, info, warn, error
+  format: json                   # Options: json, text
+  
+  # Log levels:
+  # - debug: Verbose logging including individual event processing
+  # - info:  Connection events, metrics export, important operations
+  # - warn:  Recoverable errors, reconnection attempts
+  # - error: Critical errors requiring attention
+
+# Example: Development logging (human-readable)
+# logging:
+#   level: debug
+#   format: text
+
+# ============================================================================
+# Event Processing Configuration (Optional)
+# ============================================================================
+# Control which events to process for performance optimization.
+
+events:
+  rtcp: true                     # Process RTCP events (real-time metrics during calls)
+  qos: true                      # Process QoS events (summary metrics at call end)
+  
+  # Performance tuning:
+  # - Both enabled (default): Full monitoring with real-time and summary metrics
+  # - rtcp: false, qos: true: Reduce event load by ~80%, only end-of-call summaries
+  # - rtcp: true, qos: false: Real-time monitoring only, no call summaries
+  # - Both disabled: Not recommended, only tracks call lifecycle
+
+# ============================================================================
+# Example Configurations for Common Scenarios
+# ============================================================================
+
+# Scenario 1: Development/Testing (Single FS, In-Memory, Debug Logging)
+# freeswitch_instances:
+#   - name: dev-fs
+#     host: localhost
+#     port: 8021
+#     password: ClueCon
+# storage:
+#   type: memory
+# opentelemetry:
+#   endpoint: localhost:4317
+#   insecure: true
+# http:
+#   port: 8080
+# logging:
+#   level: debug
+#   format: text
+
+# Scenario 2: Production (Multiple FS, Redis, Secure OTel, JSON Logging)
+# freeswitch_instances:
+#   - name: fs-prod-01
+#     host: 10.0.1.10
+#     port: 8021
+#     password: ${FS_PASSWORD_01}
+#   - name: fs-prod-02
+#     host: 10.0.1.11
+#     port: 8021
+#     password: ${FS_PASSWORD_02}
+# storage:
+#   type: redis
+#   redis:
+#     host: redis-cluster.internal
+#     port: 6379
+#     password: ${REDIS_PASSWORD}
+#     db: 0
+# opentelemetry:
+#   endpoint: otel-collector.internal:4317
+#   insecure: false
+#   headers:
+#     x-api-key: ${OTEL_API_KEY}
+# http:
+#   port: 8080
+# logging:
+#   level: info
+#   format: json
+# events:
+#   rtcp: true
+#   qos: true
+
+# Scenario 3: High-Volume Environment (Optimized for Performance)
+# freeswitch_instances:
+#   - name: fs-hv-01
+#     host: 10.0.2.10
+#     port: 8021
+#     password: ${FS_PASSWORD}
+# storage:
+#   type: redis  # Use Redis for persistence
+#   redis:
+#     host: redis-cache.internal
+#     port: 6379
+#     password: ${REDIS_PASSWORD}
+#     db: 0
+# opentelemetry:
+#   endpoint: otel-collector.internal:4317
+#   insecure: false
+# http:
+#   port: 8080
+# logging:
+#   level: warn  # Reduce log volume
+#   format: json
+# events:
+#   rtcp: false  # Disable real-time RTCP to reduce event load by 80%
+#   qos: true    # Keep end-of-call summaries for reporting

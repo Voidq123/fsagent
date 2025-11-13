@@ -16,6 +16,7 @@ type Config struct {
 	OpenTelemetry       OTelConfig    `yaml:"opentelemetry"`
 	HTTP                HTTPConfig    `yaml:"http"`
 	Logging             LoggingConfig `yaml:"logging"`
+	Events              EventsConfig  `yaml:"events"`
 }
 
 // FSConfig represents FreeSWITCH connection configuration
@@ -56,6 +57,12 @@ type HTTPConfig struct {
 type LoggingConfig struct {
 	Level  string `yaml:"level"`  // debug, info, warn, error
 	Format string `yaml:"format"` // json, text
+}
+
+// EventsConfig represents events processing configuration
+type EventsConfig struct {
+	RTCP bool `yaml:"rtcp"` // Enable RTCP events processing
+	QoS  bool `yaml:"qos"`  // Enable QoS events processing
 }
 
 // Load loads configuration from file or environment variables
@@ -132,6 +139,16 @@ func loadFromEnv(cfg *Config) error {
 	// Logging format
 	if format := os.Getenv("FSAGENT_LOG_FORMAT"); format != "" {
 		cfg.Logging.Format = format
+	}
+
+	// Events RTCP
+	if rtcp := os.Getenv("FSAGENT_EVENTS_RTCP"); rtcp != "" {
+		cfg.Events.RTCP = rtcp == "true"
+	}
+
+	// Events QoS
+	if qos := os.Getenv("FSAGENT_EVENTS_QOS"); qos != "" {
+		cfg.Events.QoS = qos == "true"
 	}
 
 	// Storage type
@@ -287,4 +304,7 @@ func (c *Config) setDefaults() {
 	if c.Storage.Type == "" {
 		c.Storage.Type = "memory"
 	}
+
+	// Default events - enable both by default
+	// Note: These are not set if explicitly configured to false in YAML
 }

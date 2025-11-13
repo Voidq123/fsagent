@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/luongdev/fsagent/pkg/metrics"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -85,6 +86,11 @@ func (m *MemoryStore) Set(ctx context.Context, channelID string, state *ChannelS
 		state:     state,
 		expiresAt: time.Now().Add(ttl),
 	}
+
+	// Track metrics
+	metricsInstance := metrics.GetMetrics()
+	metricsInstance.IncrementStorageOperations("set", "success")
+
 	return nil
 }
 
@@ -95,13 +101,23 @@ func (m *MemoryStore) Get(ctx context.Context, channelID string) (*ChannelState,
 
 	entry, exists := m.data[channelID]
 	if !exists {
+		// Track metrics
+		metricsInstance := metrics.GetMetrics()
+		metricsInstance.IncrementStorageOperations("get", "error")
 		return nil, fmt.Errorf("channel state not found: %s", channelID)
 	}
 
 	// Check if expired
 	if time.Now().After(entry.expiresAt) {
+		// Track metrics
+		metricsInstance := metrics.GetMetrics()
+		metricsInstance.IncrementStorageOperations("get", "error")
 		return nil, fmt.Errorf("channel state expired: %s", channelID)
 	}
+
+	// Track metrics
+	metricsInstance := metrics.GetMetrics()
+	metricsInstance.IncrementStorageOperations("get", "success")
 
 	return entry.state, nil
 }
@@ -112,6 +128,11 @@ func (m *MemoryStore) Delete(ctx context.Context, channelID string) error {
 	defer m.mu.Unlock()
 
 	delete(m.data, channelID)
+
+	// Track metrics
+	metricsInstance := metrics.GetMetrics()
+	metricsInstance.IncrementStorageOperations("delete", "success")
+
 	return nil
 }
 
@@ -188,12 +209,22 @@ func (r *RedisStore) Set(ctx context.Context, channelID string, state *ChannelSt
 
 	data, err := json.Marshal(state)
 	if err != nil {
+		// Track metrics
+		metricsInstance := metrics.GetMetrics()
+		metricsInstance.IncrementStorageOperations("set", "error")
 		return fmt.Errorf("failed to marshal channel state: %w", err)
 	}
 
 	if err := r.client.Set(ctx, key, data, ttl).Err(); err != nil {
+		// Track metrics
+		metricsInstance := metrics.GetMetrics()
+		metricsInstance.IncrementStorageOperations("set", "error")
 		return fmt.Errorf("failed to set channel state in Redis: %w", err)
 	}
+
+	// Track metrics
+	metricsInstance := metrics.GetMetrics()
+	metricsInstance.IncrementStorageOperations("set", "success")
 
 	return nil
 }
@@ -204,16 +235,29 @@ func (r *RedisStore) Get(ctx context.Context, channelID string) (*ChannelState, 
 
 	data, err := r.client.Get(ctx, key).Bytes()
 	if err == redis.Nil {
+		// Track metrics
+		metricsInstance := metrics.GetMetrics()
+		metricsInstance.IncrementStorageOperations("get", "error")
 		return nil, fmt.Errorf("channel state not found: %s", channelID)
 	}
 	if err != nil {
+		// Track metrics
+		metricsInstance := metrics.GetMetrics()
+		metricsInstance.IncrementStorageOperations("get", "error")
 		return nil, fmt.Errorf("failed to get channel state from Redis: %w", err)
 	}
 
 	var state ChannelState
 	if err := json.Unmarshal(data, &state); err != nil {
+		// Track metrics
+		metricsInstance := metrics.GetMetrics()
+		metricsInstance.IncrementStorageOperations("get", "error")
 		return nil, fmt.Errorf("failed to unmarshal channel state: %w", err)
 	}
+
+	// Track metrics
+	metricsInstance := metrics.GetMetrics()
+	metricsInstance.IncrementStorageOperations("get", "success")
 
 	return &state, nil
 }
@@ -223,8 +267,15 @@ func (r *RedisStore) Delete(ctx context.Context, channelID string) error {
 	key := r.prefix + channelID
 
 	if err := r.client.Del(ctx, key).Err(); err != nil {
+		// Track metrics
+		metricsInstance := metrics.GetMetrics()
+		metricsInstance.IncrementStorageOperations("delete", "error")
 		return fmt.Errorf("failed to delete channel state from Redis: %w", err)
 	}
+
+	// Track metrics
+	metricsInstance := metrics.GetMetrics()
+	metricsInstance.IncrementStorageOperations("delete", "success")
 
 	return nil
 }
