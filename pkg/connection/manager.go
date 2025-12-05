@@ -57,12 +57,10 @@ type FSConnection struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	connErr     chan error
-	rtcpEnabled bool
-	qosEnabled  bool
 }
 
 // NewFSConnection creates a new FSConnection instance
-func NewFSConnection(cfg config.FSConfig, rtcpEnabled bool, qosEnabled bool) *FSConnection {
+func NewFSConnection(cfg config.FSConfig) *FSConnection {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &FSConnection{
 		config:      cfg,
@@ -73,10 +71,8 @@ func NewFSConnection(cfg config.FSConfig, rtcpEnabled bool, qosEnabled bool) *FS
 			InstanceName: cfg.Name,
 			Connected:    false,
 		},
-		ctx:         ctx,
-		cancel:      cancel,
-		rtcpEnabled: rtcpEnabled,
-		qosEnabled:  qosEnabled,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 }
 
@@ -91,22 +87,12 @@ func (fc *FSConnection) Connect() error {
 	// Event handlers map: event name -> list of handler functions
 	eventHandlers := make(map[string][]func(string, int))
 
-	// Build event list based on enabled features
+	// Build event list - only essential events
 	events := []string{
-		"CHANNEL_CREATE",
-		"CHANNEL_PROGRESS_MEDIA",
-		"CHANNEL_BRIDGE",
-		"CHANNEL_ANSWER",
-	}
-
-	// Only subscribe to CHANNEL_DESTROY if QoS is enabled
-	if fc.qosEnabled {
-		events = append(events, "CHANNEL_DESTROY")
-	}
-
-	// Only subscribe to RTCP events if RTCP is enabled
-	if fc.rtcpEnabled {
-		events = append(events, "RECV_RTCP_MESSAGE", "SEND_RTCP_MESSAGE")
+		"CHANNEL_CREATE",    // Need for initial state
+		"CHANNEL_DESTROY",   // Need for exporting aggregated metrics
+		"RECV_RTCP_MESSAGE", // RTCP metrics (inbound)
+		"SEND_RTCP_MESSAGE", // RTCP metrics (outbound)
 	}
 
 	for _, eventName := range events {
@@ -148,27 +134,10 @@ func (fc *FSConnection) Connect() error {
 	logger.InfoWithFields(map[string]interface{}{
 		"fs_instance": fc.config.Name,
 		"address":     addr,
-		"rtcp":        fc.rtcpEnabled,
-		"qos":         fc.qosEnabled,
 	}, "Successfully connected to FreeSWITCH instance")
 
 	// Update connection metrics
 	metrics.GetMetrics().SetFSConnectionStatus(fc.config.Name, true)
-
-	return nil
-}
-
-// subscribeToEvent subscribes to a specific FreeSWITCH event
-func (fc *FSConnection) subscribeToEvent(eventName string) error {
-	if fc.conn == nil {
-		return fmt.Errorf("connection not established")
-	}
-
-	// Send event subscription command
-	cmd := fmt.Sprintf("event plain %s", eventName)
-	if _, err := fc.conn.Send(cmd); err != nil {
-		return fmt.Errorf("failed to send subscribe command: %w", err)
-	}
 
 	return nil
 }
@@ -428,12 +397,12 @@ type DefaultConnectionManager struct {
 }
 
 // NewConnectionManager creates a new ConnectionManager instance
-func NewConnectionManager(configs []config.FSConfig, rtcpEnabled bool, qosEnabled bool) ConnectionManager {
+func NewConnectionManager(configs []config.FSConfig) ConnectionManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	connections := make([]*FSConnection, 0, len(configs))
 	for _, cfg := range configs {
-		conn := NewFSConnection(cfg, rtcpEnabled, qosEnabled)
+		conn := NewFSConnection(cfg)
 		connections = append(connections, conn)
 	}
 

@@ -27,8 +27,7 @@ type MetricsExporter interface {
 	// ExportRTCP sends RTCP metrics to OTel
 	ExportRTCP(ctx context.Context, metrics *calculator.RTCPMetrics) error
 
-	// ExportQoS sends QoS metrics to OTel
-	ExportQoS(ctx context.Context, metrics *calculator.QoSMetrics) error
+	// QoS removed - only RTCP metrics now
 
 	// Start begins metric export with batching
 	Start(ctx context.Context) error
@@ -317,16 +316,6 @@ func (e *otelExporter) processBatch(ctx context.Context, batch []interface{}) {
 					"error":          err.Error(),
 				}, "Error recording RTCP metrics")
 			}
-		case *calculator.QoSMetrics:
-			if err := e.recordQoSMetrics(ctx, metric); err != nil {
-				// Log error but continue processing
-				logger.ErrorWithFields(map[string]interface{}{
-					"channel_id":     metric.ChannelID,
-					"correlation_id": metric.CorrelationID,
-					"fs_instance":    metric.InstanceName,
-					"error":          err.Error(),
-				}, "Error recording QoS metrics")
-			}
 		}
 	}
 }
@@ -388,80 +377,7 @@ func (e *otelExporter) recordRTCPMetrics(ctx context.Context, metrics *calculato
 	return nil
 }
 
-// ExportQoS sends QoS metrics to OTel
-func (e *otelExporter) ExportQoS(ctx context.Context, metrics *calculator.QoSMetrics) error {
-	select {
-	case e.batchChan <- metrics:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-		// Channel full, record immediately
-		return e.recordQoSMetrics(ctx, metrics)
-	}
-}
-
-// recordQoSMetrics records QoS metrics with appropriate labels
-func (e *otelExporter) recordQoSMetrics(ctx context.Context, metrics *calculator.QoSMetrics) error {
-	// Create common attributes
-	commonAttrs := []attribute.KeyValue{
-		attribute.String("fs_instance", metrics.InstanceName),
-		attribute.String("channel_id", metrics.ChannelID),
-		attribute.String("correlation_id", metrics.CorrelationID),
-		attribute.String("domain_name", metrics.DomainName),
-	}
-
-	// Add timestamp if configured
-	if e.includeTimestamp {
-		commonAttrs = append(commonAttrs, attribute.Int64("timestamp", time.Now().Unix()))
-	}
-
-	// Record MOS score with codec and endpoint info (skip if zero and skipZeroValues is enabled)
-	if !e.skipZeroValues || metrics.MOSScore != 0 {
-		mosAttrs := append(commonAttrs,
-			attribute.String("codec_name", metrics.CodecName),
-			attribute.String("src_ip", metrics.SrcIP),
-			attribute.String("dst_ip", metrics.DstIP),
-		)
-		e.qosMOS.Record(ctx, metrics.MOSScore, metric.WithAttributes(mosAttrs...))
-	}
-
-	// Record jitter metrics with codec info
-	jitterAttrs := append(commonAttrs,
-		attribute.String("codec_name", metrics.CodecName),
-	)
-
-	if !e.skipZeroValues || metrics.AvgJitter != 0 {
-		e.qosAvgJitter.Record(ctx, metrics.AvgJitter, metric.WithAttributes(jitterAttrs...))
-	}
-
-	if !e.skipZeroValues || metrics.MinJitter != 0 {
-		e.qosMinJitter.Record(ctx, metrics.MinJitter, metric.WithAttributes(jitterAttrs...))
-	}
-
-	if !e.skipZeroValues || metrics.MaxJitter != 0 {
-		e.qosMaxJitter.Record(ctx, metrics.MaxJitter, metric.WithAttributes(jitterAttrs...))
-	}
-
-	if !e.skipZeroValues || metrics.Delta != 0 {
-		e.qosDelta.Record(ctx, metrics.Delta, metric.WithAttributes(jitterAttrs...))
-	}
-
-	// Record traffic metrics (skip if zero and skipZeroValues is enabled)
-	if !e.skipZeroValues || metrics.TotalPackets != 0 {
-		e.qosTotalPackets.Record(ctx, metrics.TotalPackets, metric.WithAttributes(commonAttrs...))
-	}
-
-	if !e.skipZeroValues || metrics.PacketLoss != 0 {
-		e.qosPacketLoss.Record(ctx, metrics.PacketLoss, metric.WithAttributes(commonAttrs...))
-	}
-
-	if !e.skipZeroValues || metrics.TotalBytes != 0 {
-		e.qosTotalBytes.Record(ctx, metrics.TotalBytes, metric.WithAttributes(commonAttrs...))
-	}
-
-	return nil
-}
+// QoS methods removed - only RTCP metrics now
 
 // Stop flushes and stops exporter
 func (e *otelExporter) Stop(ctx context.Context) error {

@@ -52,6 +52,14 @@ type ChannelState struct {
 	SendPackets     int64  `json:"send_packets"`      // Cumulative
 	SendOctets      int64  `json:"send_octets"`       // Cumulative
 	SendPacketsLost int32  `json:"send_packets_lost"` // Cumulative
+
+	// RTCP Aggregation - for periodic and end-of-call metrics
+	RTCPSampleCount int       `json:"rtcp_sample_count"` // Number of RTCP samples received
+	AvgJitter       float64   `json:"avg_jitter"`        // Running average jitter (ms)
+	MaxJitter       float64   `json:"max_jitter"`        // Peak jitter (ms)
+	MinJitter       float64   `json:"min_jitter"`        // Minimum jitter (ms)
+	TotalPacketLoss int64     `json:"total_packet_loss"` // Total packets lost across all samples
+	LastExportedAt  time.Time `json:"last_exported_at"`  // Last time metrics were exported
 }
 
 // MemoryStore implements StateStore using in-memory storage

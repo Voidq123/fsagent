@@ -112,9 +112,6 @@ func main() {
 	logger.Info("RTCP calculator initialized")
 
 	// Initialize QoS Calculator
-	qosCalculator := calculator.NewQoSCalculator(stateStore)
-	logger.Info("QoS calculator initialized")
-
 	// Initialize OpenTelemetry Metrics Exporter
 	metricsExporter, err := exporter.NewMetricsExporter(&cfg.OpenTelemetry)
 	if err != nil {
@@ -123,9 +120,9 @@ func main() {
 	}
 	logger.Info("Metrics exporter initialized: endpoint=%s", cfg.OpenTelemetry.Endpoint)
 
-	// Initialize Event Processor
-	eventProcessor := processor.NewEventProcessor(stateStore, rtcpCalculator, qosCalculator, metricsExporter, cfg.Events.RTCP, cfg.Events.QoS)
-	logger.Info("Event processor initialized: rtcp=%v, qos=%v", cfg.Events.RTCP, cfg.Events.QoS)
+	// Initialize Event Processor (RTCP always enabled)
+	eventProcessor := processor.NewEventProcessor(stateStore, rtcpCalculator, metricsExporter)
+	logger.Info("Event processor initialized")
 	if err := eventProcessor.Start(ctx); err != nil {
 		logger.Error("Failed to start event processor: %v", err)
 		os.Exit(1)
@@ -133,8 +130,8 @@ func main() {
 	defer eventProcessor.Stop()
 	logger.Info("Event processor started")
 
-	// Initialize Connection Manager
-	connManager := connection.NewConnectionManager(cfg.FreeSwitchInstances, cfg.Events.RTCP, cfg.Events.QoS)
+	// Initialize Connection Manager (RTCP always enabled)
+	connManager := connection.NewConnectionManager(cfg.FreeSwitchInstances)
 
 	// Set event processor as the event forwarder
 	if cm, ok := connManager.(*connection.DefaultConnectionManager); ok {

@@ -11,10 +11,14 @@ import (
 	"github.com/luongdev/fsagent/pkg/store"
 )
 
-// RTCPCalculator processes RTCP events and calculates metrics
+// RTCPCalculator processes RTCP events and aggregates metrics
 type RTCPCalculator interface {
-	// CalculateMetrics processes RTCP event and returns metrics
-	CalculateMetrics(ctx context.Context, event *connection.FSEvent, direction string, instanceName string) (*RTCPMetrics, error)
+	// AggregateMetrics processes RTCP event and updates running averages in state
+	// Returns (shouldExport bool, metrics *RTCPMetrics, error) - shouldExport is true if 30s elapsed since last export
+	AggregateMetrics(ctx context.Context, event *connection.FSEvent, direction string, instanceName string) (bool, *RTCPMetrics, error)
+
+	// GetAggregatedMetrics retrieves final aggregated metrics for a channel (called at end of call)
+	GetAggregatedMetrics(ctx context.Context, channelID string, instanceName string) (*RTCPMetrics, error)
 }
 
 // RTCPMetrics represents calculated RTCP metrics
@@ -24,29 +28,31 @@ type RTCPMetrics struct {
 	ChannelID     string // Unique-ID for per-leg monitoring
 	CorrelationID string // SIP Call-ID for per-call aggregation
 	DomainName    string // SIP domain for filtering by tenant/domain
-	Direction     string // "inbound" or "outbound"
+	Direction     string // "aggregated" for end-of-call metrics
 
-	// RTCP Report Block
-	SSRC         uint32
-	FractionLost uint8
-	PacketsLost  int32 // Incremental
-	HighestSeqNo uint32
-	Jitter       float64 // in milliseconds
-	LSR          uint32
-	DLSR         uint32
+	// Aggregated RTCP metrics
+	Jitter      float64 // Average jitter in milliseconds
+	PacketsLost int32   // Total packets lost
 
-	// Sender Information
-	PacketsSent      int64 // Incremental
-	OctetsSent       int64 // Incremental
-	NTPTimestampSec  uint32
-	NTPTimestampUsec uint32
-	RTPTimestamp     uint32
+	// Traffic stats
+	PacketsSent int64 // Total packets sent
+	OctetsSent  int64 // Total octets sent
 
 	// Media endpoints
 	SrcIP   string
 	SrcPort uint16
 	DstIP   string
 	DstPort uint16
+
+	// Legacy fields (kept for compatibility)
+	SSRC             uint32
+	FractionLost     uint8
+	HighestSeqNo     uint32
+	LSR              uint32
+	DLSR             uint32
+	NTPTimestampSec  uint32
+	NTPTimestampUsec uint32
+	RTPTimestamp     uint32
 }
 
 // rtcpCalculator implements RTCPCalculator interface
@@ -61,309 +67,197 @@ func NewRTCPCalculator(store store.StateStore) RTCPCalculator {
 	}
 }
 
-// CalculateMetrics processes RTCP event and returns metrics
-func (rc *rtcpCalculator) CalculateMetrics(ctx context.Context, event *connection.FSEvent, direction string, instanceName string) (*RTCPMetrics, error) {
+// AggregateMetrics processes RTCP event and updates running averages in state
+// Returns (shouldExport bool, metrics *RTCPMetrics, error) - shouldExport is true if 30s elapsed
+func (rc *rtcpCalculator) AggregateMetrics(ctx context.Context, event *connection.FSEvent, direction string, instanceName string) (bool, *RTCPMetrics, error) {
 	channelID := event.GetHeader("Unique-ID")
 	if channelID == "" {
-		return nil, fmt.Errorf("RTCP event missing Unique-ID")
+		return false, nil, fmt.Errorf("RTCP event missing Unique-ID")
 	}
 
 	// Get channel state
 	state, err := rc.store.Get(ctx, channelID)
 	if err != nil {
-		logger.ErrorWithFields(map[string]interface{}{
+		logger.WarnWithFields(map[string]interface{}{
 			"channel_id":  channelID,
 			"fs_instance": instanceName,
 			"direction":   direction,
 			"error":       err.Error(),
-		}, "Failed to get channel state for RTCP calculation")
+		}, "Channel state not found for RTCP aggregation")
+		return false, nil, fmt.Errorf("failed to get channel state: %w", err)
+	}
+
+	// Extract jitter from event
+	var jitter float64
+	if direction == "inbound" {
+		if jitterStr := event.GetHeader("Source0-Jitter"); jitterStr != "" {
+			if j, err := strconv.ParseFloat(jitterStr, 64); err == nil {
+				jitter = j
+			}
+		}
+	} else {
+		if jitterStr := event.GetHeader("Source-Jitter"); jitterStr != "" {
+			if j, err := strconv.ParseFloat(jitterStr, 64); err == nil {
+				jitter = j
+			}
+		}
+	}
+
+	// Extract packet loss
+	var packetsLost int32
+	if direction == "inbound" {
+		if lostStr := event.GetHeader("Source0-Lost"); lostStr != "" {
+			if lost, err := strconv.ParseInt(lostStr, 10, 32); err == nil {
+				packetsLost = int32(lost)
+			}
+		}
+	} else {
+		if lostStr := event.GetHeader("Source-Lost"); lostStr != "" {
+			if lost, err := strconv.ParseInt(lostStr, 10, 32); err == nil {
+				packetsLost = int32(lost)
+			}
+		}
+	}
+
+	// Update aggregation
+	state.RTCPSampleCount++
+
+	// Update running average jitter
+	if state.RTCPSampleCount == 1 {
+		state.AvgJitter = jitter
+		state.MinJitter = jitter
+		state.MaxJitter = jitter
+	} else {
+		// Running average: new_avg = old_avg + (new_value - old_avg) / count
+		state.AvgJitter = state.AvgJitter + (jitter-state.AvgJitter)/float64(state.RTCPSampleCount)
+
+		if jitter > state.MaxJitter {
+			state.MaxJitter = jitter
+		}
+		if jitter < state.MinJitter {
+			state.MinJitter = jitter
+		}
+	}
+
+	// Accumulate packet loss
+	state.TotalPacketLoss += int64(packetsLost)
+
+	state.UpdatedAt = time.Now()
+
+	// Store updated state
+	ttl := 24 * time.Hour
+	if err := rc.store.Set(ctx, channelID, state, ttl); err != nil {
+		return false, nil, fmt.Errorf("failed to update state with aggregated metrics: %w", err)
+	}
+
+	logger.DebugWithFields(map[string]interface{}{
+		"channel_id":        channelID,
+		"correlation_id":    state.CorrelationID,
+		"direction":         direction,
+		"sample_count":      state.RTCPSampleCount,
+		"current_jitter":    jitter,
+		"avg_jitter":        state.AvgJitter,
+		"total_packet_loss": state.TotalPacketLoss,
+	}, "RTCP metrics aggregated")
+
+	// Check if we should export (every 30 seconds)
+	now := time.Now()
+	shouldExport := false
+	var metrics *RTCPMetrics
+
+	if state.LastExportedAt.IsZero() || now.Sub(state.LastExportedAt) >= 30*time.Second {
+		// Time to export periodic metrics
+		shouldExport = true
+		metrics = &RTCPMetrics{
+			Timestamp:     now,
+			InstanceName:  instanceName,
+			ChannelID:     channelID,
+			CorrelationID: state.CorrelationID,
+			DomainName:    state.DomainName,
+			Direction:     "aggregated",
+
+			// Aggregated values
+			Jitter:      state.AvgJitter,
+			PacketsLost: int32(state.TotalPacketLoss),
+
+			// Traffic stats
+			PacketsSent: state.RecvPackets + state.SendPackets,
+			OctetsSent:  state.RecvOctets + state.SendOctets,
+
+			// Endpoints
+			SrcIP:   state.LocalMediaIP,
+			SrcPort: state.LocalMediaPort,
+			DstIP:   state.RemoteMediaIP,
+			DstPort: state.RemoteMediaPort,
+		}
+
+		// Update last exported time
+		state.LastExportedAt = now
+		state.UpdatedAt = now
+
+		// Store updated state
+		ttl := 24 * time.Hour
+		if err := rc.store.Set(ctx, channelID, state, ttl); err != nil {
+			return false, nil, fmt.Errorf("failed to update last exported time: %w", err)
+		}
+
+		logger.InfoWithFields(map[string]interface{}{
+			"channel_id":        channelID,
+			"correlation_id":    state.CorrelationID,
+			"sample_count":      state.RTCPSampleCount,
+			"avg_jitter":        state.AvgJitter,
+			"total_packet_loss": state.TotalPacketLoss,
+		}, "Periodic RTCP metrics ready for export")
+	}
+
+	return shouldExport, metrics, nil
+}
+
+// GetAggregatedMetrics retrieves final aggregated metrics for a channel
+func (rc *rtcpCalculator) GetAggregatedMetrics(ctx context.Context, channelID string, instanceName string) (*RTCPMetrics, error) {
+	// Get channel state
+	state, err := rc.store.Get(ctx, channelID)
+	if err != nil {
 		return nil, fmt.Errorf("failed to get channel state: %w", err)
 	}
 
-	// Initialize metrics
+	if state.RTCPSampleCount == 0 {
+		return nil, fmt.Errorf("no RTCP samples collected for channel")
+	}
+
+	// Build aggregated metrics from state
 	metrics := &RTCPMetrics{
 		Timestamp:     time.Now(),
 		InstanceName:  instanceName,
 		ChannelID:     channelID,
 		CorrelationID: state.CorrelationID,
 		DomainName:    state.DomainName,
-		Direction:     direction,
+		Direction:     "aggregated", // This is aggregated from both directions
+
+		// Aggregated values
+		Jitter:      state.AvgJitter,              // Average jitter
+		PacketsLost: int32(state.TotalPacketLoss), // Total packet loss
+
+		// Additional stats (can be used for monitoring)
+		PacketsSent: state.RecvPackets + state.SendPackets,
+		OctetsSent:  state.RecvOctets + state.SendOctets,
+
+		// Endpoints
+		SrcIP:   state.LocalMediaIP,
+		SrcPort: state.LocalMediaPort,
+		DstIP:   state.RemoteMediaIP,
+		DstPort: state.RemoteMediaPort,
 	}
 
-	// Extract metrics based on direction
-	if direction == "inbound" {
-		// RECV_RTCP_MESSAGE: uses Source0-* headers
-		if err := rc.extractRecvMetrics(event, metrics, state); err != nil {
-			return nil, err
-		}
-		// Set endpoints: srcIp=local, dstIp=remote
-		metrics.SrcIP = state.LocalMediaIP
-		metrics.SrcPort = state.LocalMediaPort
-		metrics.DstIP = state.RemoteMediaIP
-		metrics.DstPort = state.RemoteMediaPort
-	} else {
-		// SEND_RTCP_MESSAGE: uses Source-* headers
-		if err := rc.extractSendMetrics(event, metrics, state); err != nil {
-			return nil, err
-		}
-		// Set endpoints: srcIp=remote, dstIp=local
-		metrics.SrcIP = state.RemoteMediaIP
-		metrics.SrcPort = state.RemoteMediaPort
-		metrics.DstIP = state.LocalMediaIP
-		metrics.DstPort = state.LocalMediaPort
-	}
-
-	// Update state with new cumulative values
-	if err := rc.updateState(ctx, channelID, state, metrics, direction); err != nil {
-		logger.ErrorWithFields(map[string]interface{}{
-			"channel_id":     channelID,
-			"correlation_id": metrics.CorrelationID,
-			"fs_instance":    instanceName,
-			"direction":      direction,
-			"error":          err.Error(),
-		}, "Failed to update state after RTCP calculation")
-		return nil, fmt.Errorf("failed to update state: %w", err)
-	}
-
-	logger.DebugWithFields(map[string]interface{}{
-		"channel_id":     channelID,
-		"correlation_id": metrics.CorrelationID,
-		"fs_instance":    instanceName,
-		"direction":      direction,
-		"jitter_ms":      metrics.Jitter,
-		"packets_lost":   metrics.PacketsLost,
-	}, "RTCP metrics calculated successfully")
+	logger.InfoWithFields(map[string]interface{}{
+		"channel_id":        channelID,
+		"correlation_id":    state.CorrelationID,
+		"sample_count":      state.RTCPSampleCount,
+		"avg_jitter":        state.AvgJitter,
+		"min_jitter":        state.MinJitter,
+		"max_jitter":        state.MaxJitter,
+		"total_packet_loss": state.TotalPacketLoss,
+	}, "Retrieved aggregated RTCP metrics")
 
 	return metrics, nil
-}
-
-// extractRecvMetrics extracts metrics from RECV_RTCP_MESSAGE event
-func (rc *rtcpCalculator) extractRecvMetrics(event *connection.FSEvent, metrics *RTCPMetrics, state *store.ChannelState) error {
-	// Extract SSRC
-	if ssrcStr := event.GetHeader("Source0-SSRC"); ssrcStr != "" {
-		if ssrc, err := strconv.ParseUint(ssrcStr, 10, 32); err == nil {
-			metrics.SSRC = uint32(ssrc)
-		}
-	}
-
-	// Extract jitter (convert to milliseconds if needed)
-	if jitterStr := event.GetHeader("Source0-Jitter"); jitterStr != "" {
-		if jitter, err := strconv.ParseFloat(jitterStr, 64); err == nil {
-			metrics.Jitter = jitter
-		}
-	}
-
-	// Extract cumulative packets lost
-	var currentPacketsLost int32
-	if lostStr := event.GetHeader("Source0-Lost"); lostStr != "" {
-		if lost, err := strconv.ParseInt(lostStr, 10, 32); err == nil {
-			currentPacketsLost = int32(lost)
-		}
-	}
-
-	// Calculate incremental packet loss
-	// Handle case where cumulative counter resets or decreases
-	metrics.PacketsLost = currentPacketsLost - state.RecvPacketsLost
-	if metrics.PacketsLost < 0 {
-		// Counter reset or decreased, use current value as delta
-		metrics.PacketsLost = currentPacketsLost
-	}
-
-	// Extract fraction lost
-	if fractionStr := event.GetHeader("Source0-Fraction"); fractionStr != "" {
-		if fraction, err := strconv.ParseUint(fractionStr, 10, 8); err == nil {
-			metrics.FractionLost = uint8(fraction)
-		}
-	}
-
-	// Extract highest sequence number
-	if seqStr := event.GetHeader("Source0-Highest-Sequence-Number-Received"); seqStr != "" {
-		if seq, err := strconv.ParseUint(seqStr, 10, 32); err == nil {
-			metrics.HighestSeqNo = uint32(seq)
-		}
-	}
-
-	// Extract LSR (Last SR timestamp)
-	if lsrStr := event.GetHeader("Source0-LSR"); lsrStr != "" {
-		if lsr, err := strconv.ParseUint(lsrStr, 10, 32); err == nil {
-			metrics.LSR = uint32(lsr)
-		}
-	}
-
-	// Extract DLSR (Delay since last SR)
-	if dlsrStr := event.GetHeader("Source0-DLSR"); dlsrStr != "" {
-		if dlsr, err := strconv.ParseUint(dlsrStr, 10, 32); err == nil {
-			metrics.DLSR = uint32(dlsr)
-		}
-	}
-
-	// Extract sender information
-	if err := rc.extractSenderInfo(event, metrics, state, "recv"); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// extractSendMetrics extracts metrics from SEND_RTCP_MESSAGE event
-func (rc *rtcpCalculator) extractSendMetrics(event *connection.FSEvent, metrics *RTCPMetrics, state *store.ChannelState) error {
-	// Extract SSRC
-	if ssrcStr := event.GetHeader("SSRC"); ssrcStr != "" {
-		if ssrc, err := strconv.ParseUint(ssrcStr, 10, 32); err == nil {
-			metrics.SSRC = uint32(ssrc)
-		}
-	}
-
-	// Extract jitter (convert to milliseconds if needed)
-	if jitterStr := event.GetHeader("Source-Jitter"); jitterStr != "" {
-		if jitter, err := strconv.ParseFloat(jitterStr, 64); err == nil {
-			metrics.Jitter = jitter
-		}
-	}
-
-	// Extract cumulative packets lost
-	var currentPacketsLost int32
-	if lostStr := event.GetHeader("Source-Lost"); lostStr != "" {
-		if lost, err := strconv.ParseInt(lostStr, 10, 32); err == nil {
-			currentPacketsLost = int32(lost)
-		}
-	}
-
-	// Calculate incremental packet loss
-	// Handle case where cumulative counter resets or decreases
-	metrics.PacketsLost = currentPacketsLost - state.SendPacketsLost
-	if metrics.PacketsLost < 0 {
-		// Counter reset or decreased, use current value as delta
-		metrics.PacketsLost = currentPacketsLost
-	}
-
-	// Extract fraction lost
-	if fractionStr := event.GetHeader("Source-Fraction"); fractionStr != "" {
-		if fraction, err := strconv.ParseUint(fractionStr, 10, 8); err == nil {
-			metrics.FractionLost = uint8(fraction)
-		}
-	}
-
-	// Extract highest sequence number
-	if seqStr := event.GetHeader("Source-Highest-Sequence-Number-Received"); seqStr != "" {
-		if seq, err := strconv.ParseUint(seqStr, 10, 32); err == nil {
-			metrics.HighestSeqNo = uint32(seq)
-		}
-	}
-
-	// Extract LSR (Last SR timestamp)
-	if lsrStr := event.GetHeader("Source-LSR"); lsrStr != "" {
-		if lsr, err := strconv.ParseUint(lsrStr, 10, 32); err == nil {
-			metrics.LSR = uint32(lsr)
-		}
-	}
-
-	// Extract DLSR (Delay since last SR)
-	if dlsrStr := event.GetHeader("Source-DLSR"); dlsrStr != "" {
-		if dlsr, err := strconv.ParseUint(dlsrStr, 10, 32); err == nil {
-			metrics.DLSR = uint32(dlsr)
-		}
-	}
-
-	// Extract sender information
-	if err := rc.extractSenderInfo(event, metrics, state, "send"); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// extractSenderInfo extracts sender information and calculates deltas
-func (rc *rtcpCalculator) extractSenderInfo(event *connection.FSEvent, metrics *RTCPMetrics, state *store.ChannelState, direction string) error {
-	// Extract sender packet count
-	var currentPackets int64
-	if packetsStr := event.GetHeader("Sender-Packet-Count"); packetsStr != "" {
-		if packets, err := strconv.ParseInt(packetsStr, 10, 64); err == nil {
-			currentPackets = packets
-		}
-	}
-
-	// Calculate incremental packets sent
-	if direction == "recv" {
-		metrics.PacketsSent = currentPackets - state.RecvPackets
-		if metrics.PacketsSent < 0 {
-			metrics.PacketsSent = currentPackets
-		}
-	} else {
-		metrics.PacketsSent = currentPackets - state.SendPackets
-		if metrics.PacketsSent < 0 {
-			metrics.PacketsSent = currentPackets
-		}
-	}
-
-	// Extract octet count
-	var currentOctets int64
-	if octetsStr := event.GetHeader("Octect-Packet-Count"); octetsStr != "" {
-		if octets, err := strconv.ParseInt(octetsStr, 10, 64); err == nil {
-			currentOctets = octets
-		}
-	}
-
-	// Calculate incremental octets sent
-	if direction == "recv" {
-		metrics.OctetsSent = currentOctets - state.RecvOctets
-		if metrics.OctetsSent < 0 {
-			metrics.OctetsSent = currentOctets
-		}
-	} else {
-		metrics.OctetsSent = currentOctets - state.SendOctets
-		if metrics.OctetsSent < 0 {
-			metrics.OctetsSent = currentOctets
-		}
-	}
-
-	// Extract NTP timestamps
-	if ntpSecStr := event.GetHeader("NTP-Most-Significant-Word"); ntpSecStr != "" {
-		if ntpSec, err := strconv.ParseUint(ntpSecStr, 10, 32); err == nil {
-			metrics.NTPTimestampSec = uint32(ntpSec)
-		}
-	}
-
-	if ntpUsecStr := event.GetHeader("NTP-Least-Significant-Word"); ntpUsecStr != "" {
-		if ntpUsec, err := strconv.ParseUint(ntpUsecStr, 10, 32); err == nil {
-			metrics.NTPTimestampUsec = uint32(ntpUsec)
-		}
-	}
-
-	// Extract RTP timestamp
-	if rtpStr := event.GetHeader("RTP-Timestamp"); rtpStr != "" {
-		if rtp, err := strconv.ParseUint(rtpStr, 10, 32); err == nil {
-			metrics.RTPTimestamp = uint32(rtp)
-		}
-	}
-
-	return nil
-}
-
-// updateState updates the channel state with new cumulative values
-func (rc *rtcpCalculator) updateState(ctx context.Context, channelID string, state *store.ChannelState, metrics *RTCPMetrics, direction string) error {
-	// Update cumulative values based on direction
-	if direction == "inbound" {
-		// Update receive state
-		state.RecvSSRC = metrics.SSRC
-		state.RecvPacketsLost = state.RecvPacketsLost + metrics.PacketsLost
-		state.RecvPackets = state.RecvPackets + metrics.PacketsSent
-		state.RecvOctets = state.RecvOctets + metrics.OctetsSent
-	} else {
-		// Update send state
-		state.SendSSRC = metrics.SSRC
-		state.SendPacketsLost = state.SendPacketsLost + metrics.PacketsLost
-		state.SendPackets = state.SendPackets + metrics.PacketsSent
-		state.SendOctets = state.SendOctets + metrics.OctetsSent
-	}
-
-	state.UpdatedAt = time.Now()
-
-	// Store updated state with 24 hour TTL
-	ttl := 24 * time.Hour
-	if err := rc.store.Set(ctx, channelID, state, ttl); err != nil {
-		return err
-	}
-
-	return nil
 }
